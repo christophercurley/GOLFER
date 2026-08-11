@@ -24,6 +24,21 @@ use lora_phy::{
 
 use panic_probe as _;
 
+use core::fmt::Write as _;
+
+use embassy_rp::i2c::{Config as I2cConfig, I2c};
+
+use embedded_graphics::{
+    mono_font::{MonoTextStyle, ascii::FONT_6X10},
+    pixelcolor::BinaryColor,
+    prelude::*,
+    text::{Baseline, Text},
+};
+
+use heapless::String;
+
+use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
+
 const LORA_FREQUENCY_HZ: u32 = 915_000_000;
 
 bind_interrupts!(struct Irqs {
@@ -44,6 +59,56 @@ async fn main(_spawner: Spawner) {
     let mut led = Output::new(p.PIN_25, Level::Low);
 
     info!("LORAMv1 online");
+
+    // -------------------------------------------------------------------------
+    // OLED
+    //
+    // I2C0
+    // GP4 = SDA
+    // GP5 = SCL
+    // -------------------------------------------------------------------------
+
+    info!("Initializing OLED...");
+
+    let i2c = I2c::new_blocking(
+        p.I2C0,
+        p.PIN_5, // SCL
+        p.PIN_4, // SDA
+        I2cConfig::default(),
+    );
+
+    let interface = I2CDisplayInterface::new(i2c);
+
+    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
+
+    display.init().unwrap();
+
+    let text_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+
+    display.clear(BinaryColor::Off).unwrap();
+
+    Text::with_baseline(
+        "LORAM RECEIVER",
+        Point::new(0, 0),
+        text_style,
+        Baseline::Top,
+    )
+    .draw(&mut display)
+    .unwrap();
+
+    Text::with_baseline(
+        "Waiting for RX...",
+        Point::new(0, 16),
+        text_style,
+        Baseline::Top,
+    )
+    .draw(&mut display)
+    .unwrap();
+
+    display.flush().unwrap();
+
+    info!("OLED initialized");
 
     // -------------------------------------------------------------------------
     // Waveshare Pico-LoRa-SX1262 pin mapping
@@ -209,6 +274,10 @@ async fn main(_spawner: Spawner) {
     // Receive packets forever
     // -------------------------------------------------------------------------
 
+    let mut last_sequence: Option<u32> = None;
+    let mut received_packets: u32 = 0;
+    let mut missed_packets: u32 = 0;
+
     loop {
         rx_buffer.fill(0);
 
@@ -221,12 +290,129 @@ async fn main(_spawner: Spawner) {
                 info!("RSSI: {} dBm", packet_status.rssi);
                 info!("SNR: {} dB", packet_status.snr);
 
-                info!("Payload: {=[u8]:x}", &rx_buffer[..len]);
+                if len >= 10 && &rx_buffer[0..4] == b"MRU1" {
+                    let sequence = u32::from_le_bytes([
+                        rx_buffer[6],
+                        rx_buffer[7],
+                        rx_buffer[8],
+                        rx_buffer[9],
+                    ]);
 
-                // Visible RX indication.
-                led.set_high();
-                Timer::after_millis(100).await;
-                led.set_low();
+                    received_packets += 1;
+
+                    if let Some(last) = last_sequence {
+                        let expected = last.wrapping_add(1);
+
+                        if sequence == expected {
+                            // Perfectly sequential packet.
+                        } else if sequence == last {
+                            info!("Duplicate packet: seq={}", sequence);
+                        } else if sequence > last {
+                            let missed = sequence - last - 1;
+
+                            missed_packets += missed;
+
+                            info!(
+                                "PACKET LOSS: missed {} packet(s) between seq={} and seq={}",
+                                missed, last, sequence
+                            );
+                        } else {
+                            // Most likely transmitter reboot/reset rather than billions
+                            // of suddenly-lost packets.
+                            info!(
+                                "Sequence reset/out-of-order: last={} current={}",
+                                last, sequence
+                            );
+                        }
+                    }
+
+                    last_sequence = Some(sequence);
+
+                    // -------------------------------------------------------------------------
+                    // Update OLED
+                    // -------------------------------------------------------------------------
+
+                    display.clear(BinaryColor::Off).unwrap();
+
+                    let mut line: String<32> = String::new();
+
+                    // Header
+                    Text::with_baseline(
+                        "LORAM RECEIVER",
+                        Point::new(0, 0),
+                        text_style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display)
+                    .unwrap();
+
+                    // Sequence
+                    write!(&mut line, "SEQ  {}", sequence).unwrap();
+
+                    Text::with_baseline(
+                        line.as_str(),
+                        Point::new(0, 12),
+                        text_style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display)
+                    .unwrap();
+
+                    line.clear();
+
+                    // RSSI
+                    write!(&mut line, "RSSI {} dBm", packet_status.rssi).unwrap();
+
+                    Text::with_baseline(
+                        line.as_str(),
+                        Point::new(0, 24),
+                        text_style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display)
+                    .unwrap();
+
+                    line.clear();
+
+                    // SNR
+                    write!(&mut line, "SNR  {} dB", packet_status.snr).unwrap();
+
+                    Text::with_baseline(
+                        line.as_str(),
+                        Point::new(0, 36),
+                        text_style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display)
+                    .unwrap();
+
+                    line.clear();
+
+                    // Packet stats
+                    write!(&mut line, "RX {} MISS {}", received_packets, missed_packets).unwrap();
+
+                    Text::with_baseline(
+                        line.as_str(),
+                        Point::new(0, 48),
+                        text_style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display)
+                    .unwrap();
+
+                    display.flush().unwrap();
+
+                    info!(
+                        "RX seq={} RSSI={} dBm SNR={} dB | received={} missed={}",
+                        sequence,
+                        packet_status.rssi,
+                        packet_status.snr,
+                        received_packets,
+                        missed_packets
+                    );
+                } else {
+                    error!("Invalid or unknown packet");
+                }
             }
 
             Err(err) => {

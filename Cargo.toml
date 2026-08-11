@@ -32,6 +32,10 @@ lora-phy = { version = "=3.0.1", default-features = false }
 
 embedded-hal-bus = { version = "=0.3.0", features = ["async"] }
 
+ssd1306 = "=0.10.0"
+embedded-graphics = "=0.8.2"
+heapless = "=0.9.3"
+
 [profile.release]
 debug = 2
 lto = "thin"
