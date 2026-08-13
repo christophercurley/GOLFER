@@ -1,38 +1,36 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write as _;
-
 use defmt::{error, info, warn};
 use defmt_rtt as _;
 
 use embassy_executor::Spawner;
-use embassy_rp::{
-    gpio::{Level, Output},
-    i2c::{Config as I2cConfig, I2c},
-};
+use embassy_rp::gpio::{Level, Output};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-
-use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_6X10},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    text::{Baseline, Text},
-};
-
-use heapless::String;
 
 use panic_probe as _;
 
-use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
-
+mod display;
 mod radio;
+
+use display::{Display, DisplayPage, RadioDisplayState};
+
+// Temporary page selection for the current 0.96" OLED.
+//
+// Until a physical UI control exists, changing this one line is enough to boot
+// directly into the radio or GPS page. display.rs already supports runtime
+// set_page()/toggle_page() for later hardware.
+const INITIAL_DISPLAY_PAGE: DisplayPage = DisplayPage::Gps;
 
 // The current nRF beacon increments its sequence once per second.
 const BEACON_SEQUENCE_RATE_HZ: u64 = 1;
 
 // If no packet arrives for this long, show LINK LOST on the OLED.
 const LINK_LOSS_TIMEOUT_SECS: u64 = 5;
+
+// The application wakes periodically to evaluate link age. This timeout is
+// applied only to the Embassy channel, never to the SX1262 receive future.
+const LINK_WATCHDOG_INTERVAL_MS: u64 = 250;
 
 // Extra slack when deciding whether a forward sequence jump is physically
 // plausible for a 1 Hz beacon. This protects the missed-packet counter from
@@ -60,7 +58,7 @@ fn decode_sequence(payload: &[u8]) -> Option<u32> {
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
 )]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     // Pico 2 onboard LED.
@@ -70,54 +68,19 @@ async fn main(_spawner: Spawner) {
     info!("LORAMv1 online");
 
     // -------------------------------------------------------------------------
-    // OLED
+    // Display
     //
-    // I2C0
+    // OLED hardware setup and all rendering now live in display.rs.
     // GP4 = SDA
     // GP5 = SCL
     // -------------------------------------------------------------------------
 
-    info!("Initializing OLED...");
-
-    let i2c = I2c::new_blocking(
+    let mut display = Display::new(
         p.I2C0,
         p.PIN_5, // SCL
         p.PIN_4, // SDA
-        I2cConfig::default(),
+        INITIAL_DISPLAY_PAGE,
     );
-
-    let interface = I2CDisplayInterface::new(i2c);
-
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-
-    display.init().unwrap();
-
-    let text_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-
-    display.clear(BinaryColor::Off).unwrap();
-
-    Text::with_baseline(
-        "LORAM RECEIVER",
-        Point::new(0, 0),
-        text_style,
-        Baseline::Top,
-    )
-    .draw(&mut display)
-    .unwrap();
-
-    Text::with_baseline(
-        "Waiting for RX...",
-        Point::new(0, 16),
-        text_style,
-        Baseline::Top,
-    )
-    .draw(&mut display)
-    .unwrap();
-
-    display.flush().unwrap();
-
-    info!("OLED initialized");
 
     // -------------------------------------------------------------------------
     // LoRa radio
@@ -127,7 +90,7 @@ async fn main(_spawner: Spawner) {
     // behavior around received packets.
     // -------------------------------------------------------------------------
 
-    let mut radio = match radio::Radio::new(
+    let radio = match radio::Radio::new(
         p.SPI1, p.PIN_10, // SCK
         p.PIN_11, // MOSI
         p.PIN_12, // MISO
@@ -153,11 +116,13 @@ async fn main(_spawner: Spawner) {
         }
     };
 
+    // The SX1262 receive future now lives permanently inside its own task.
+    // The application only waits on RX_CHANNEL, which is safe to timeout.
+    spawner.spawn(radio::receive_task(radio).expect("failed to create radio receive task"));
+
     // -------------------------------------------------------------------------
     // Receiver state
     // -------------------------------------------------------------------------
-
-    let mut rx_buffer = [0u8; radio::RX_BUFFER_SIZE];
 
     let mut last_sequence: Option<u32> = None;
     let mut last_valid_rx_time: Option<Instant> = None;
@@ -175,22 +140,22 @@ async fn main(_spawner: Spawner) {
     // -------------------------------------------------------------------------
 
     loop {
-        rx_buffer.fill(0);
-
         let rx_result = with_timeout(
-            Duration::from_secs(LINK_LOSS_TIMEOUT_SECS),
-            radio.receive(&mut rx_buffer),
+            Duration::from_millis(LINK_WATCHDOG_INTERVAL_MS),
+            radio::RX_CHANNEL.receive(),
         )
         .await;
 
         match rx_result {
             // -----------------------------------------------------------------
-            // Radio returned a packet/result before the link-loss timeout.
+            // Dedicated radio task delivered a packet.
             // -----------------------------------------------------------------
-            Ok(Ok((received_len, packet_status))) => {
+            Ok(packet) => {
+                let received_len = packet.len;
                 let len = received_len as usize;
+                let packet_status = packet.status;
 
-                let Some(sequence) = decode_sequence(&rx_buffer[..len]) else {
+                let Some(sequence) = decode_sequence(&packet.data[..len]) else {
                     warn!("Ignoring invalid/unknown packet: len={}", received_len);
                     continue;
                 };
@@ -281,49 +246,16 @@ async fn main(_spawner: Spawner) {
                 );
 
                 // -------------------------------------------------------------
-                // Update OLED with live receiver data.
+                // Update display state.
                 // -------------------------------------------------------------
 
-                display.clear(BinaryColor::Off).unwrap();
-
-                let mut line: String<32> = String::new();
-
-                Text::with_baseline(
-                    "LORAM RECEIVER",
-                    Point::new(0, 0),
-                    text_style,
-                    Baseline::Top,
-                )
-                .draw(&mut display)
-                .unwrap();
-
-                write!(&mut line, "SEQ  {}", sequence).unwrap();
-                Text::with_baseline(line.as_str(), Point::new(0, 12), text_style, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
-                line.clear();
-
-                write!(&mut line, "RSSI {} dBm", packet_status.rssi).unwrap();
-                Text::with_baseline(line.as_str(), Point::new(0, 24), text_style, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
-                line.clear();
-
-                write!(&mut line, "SNR  {} dB", packet_status.snr).unwrap();
-                Text::with_baseline(line.as_str(), Point::new(0, 36), text_style, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
-                line.clear();
-
-                write!(&mut line, "RX {} MISS {}", received_packets, missed_packets).unwrap();
-                Text::with_baseline(line.as_str(), Point::new(0, 48), text_style, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
-                display.flush().unwrap();
+                display.update_radio(RadioDisplayState::connected(
+                    sequence,
+                    packet_status.rssi,
+                    packet_status.snr,
+                    received_packets,
+                    missed_packets,
+                ));
 
                 // Brief visible indication of an accepted packet.
                 led.set_high();
@@ -332,19 +264,19 @@ async fn main(_spawner: Spawner) {
             }
 
             // -----------------------------------------------------------------
-            // The radio itself returned an RX error.
-            // -----------------------------------------------------------------
-            Ok(Err(err)) => {
-                error!("RX error: {}", err);
-            }
-
-            // -----------------------------------------------------------------
-            // No RX result for LINK_LOSS_TIMEOUT_SECS.
+            // Watchdog tick: no packet arrived on the application channel during
+            // this short interval. The SX1262 task is still receiving normally.
             // -----------------------------------------------------------------
             Err(_) => {
                 // Before the first valid packet, keep the startup
                 // "Waiting for RX..." screen rather than calling it a lost link.
-                if last_sequence.is_none() {
+                let Some(last_rx_time) = last_valid_rx_time else {
+                    continue;
+                };
+
+                let link_age_secs = Instant::now().duration_since(last_rx_time).as_secs();
+
+                if link_age_secs < LINK_LOSS_TIMEOUT_SECS {
                     continue;
                 }
 
@@ -354,67 +286,15 @@ async fn main(_spawner: Spawner) {
                     continue;
                 }
 
-                warn!(
-                    "LINK LOST: no valid packet for {} seconds",
-                    LINK_LOSS_TIMEOUT_SECS
-                );
+                warn!("LINK LOST: no valid packet for {} seconds", link_age_secs);
 
-                display.clear(BinaryColor::Off).unwrap();
-
-                let mut line: String<32> = String::new();
-
-                Text::with_baseline(
-                    "LORAM RECEIVER",
-                    Point::new(0, 0),
-                    text_style,
-                    Baseline::Top,
-                )
-                .draw(&mut display)
-                .unwrap();
-
-                Text::with_baseline(
-                    "!!! LINK LOST !!!",
-                    Point::new(0, 12),
-                    text_style,
-                    Baseline::Top,
-                )
-                .draw(&mut display)
-                .unwrap();
-
-                if let Some(sequence) = last_sequence {
-                    write!(&mut line, "LAST SEQ {}", sequence).unwrap();
-                    Text::with_baseline(
-                        line.as_str(),
-                        Point::new(0, 24),
-                        text_style,
-                        Baseline::Top,
-                    )
-                    .draw(&mut display)
-                    .unwrap();
-
-                    line.clear();
-                }
-
-                if let (Some(rssi), Some(snr)) = (last_rssi, last_snr) {
-                    write!(&mut line, "RSSI {} SNR {}", rssi, snr).unwrap();
-                    Text::with_baseline(
-                        line.as_str(),
-                        Point::new(0, 36),
-                        text_style,
-                        Baseline::Top,
-                    )
-                    .draw(&mut display)
-                    .unwrap();
-
-                    line.clear();
-                }
-
-                write!(&mut line, "RX {} MISS {}", received_packets, missed_packets).unwrap();
-                Text::with_baseline(line.as_str(), Point::new(0, 48), text_style, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
-                display.flush().unwrap();
+                display.update_radio(RadioDisplayState::lost(
+                    last_sequence,
+                    last_rssi,
+                    last_snr,
+                    received_packets,
+                    missed_packets,
+                ));
 
                 link_lost_displayed = true;
             }

@@ -11,6 +11,7 @@ dependencies = [
  "defmt-rtt",
  "embassy-executor",
  "embassy-rp",
+ "embassy-sync",
  "embassy-time",
  "embedded-graphics",
  "embedded-hal-bus",
@@ -530,6 +531,7 @@ checksum = "7bbd85cf5a5ae56bdf26f618364af642d1d0a4e245cdd75cd9aabda382f65a81"
 dependencies = [
  "cfg-if",
  "critical-section",
+ "defmt 1.0.1",
  "embedded-io-async 0.7.0",
  "futures-core",
  "futures-sink",

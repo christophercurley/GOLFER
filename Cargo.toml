@@ -10,6 +10,7 @@ resolver = "2"
 
 [dependencies]
 embassy-executor = { version = "=0.10.0", features = ["defmt"] }
+embassy-sync = { version = "=0.8.0", features = ["defmt"] }
 
 embassy-time = { version = "=0.5.1", features = [
     "defmt",
