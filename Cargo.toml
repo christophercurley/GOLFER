@@ -41,6 +41,7 @@ cortex-m-rt = "0.7"
 
 lora-phy = { version = "=3.0.1", default-features = false }
 embedded-hal-bus = { version = "=0.3.0", features = ["async"] }
+embedded-io-async = "=0.7.0"
 
 # -----------------------------------------------------------------------------
 # Display / UI
@@ -49,6 +50,7 @@ embedded-hal-bus = { version = "=0.3.0", features = ["async"] }
 ssd1306 = "=0.10.0"
 embedded-graphics = "=0.8.2"
 heapless = "=0.9.3"
+static_cell = "=2.1.1"
 
 # -----------------------------------------------------------------------------
 # Release profile

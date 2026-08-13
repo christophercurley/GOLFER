@@ -11,6 +11,7 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 use panic_probe as _;
 
 mod display;
+mod gps;
 mod radio;
 
 use display::{Display, DisplayPage, RadioDisplayState};
@@ -80,6 +81,20 @@ async fn main(spawner: Spawner) {
         p.PIN_5, // SCL
         p.PIN_4, // SDA
         INITIAL_DISPLAY_PAGE,
+    );
+
+    // -------------------------------------------------------------------------
+    // GPS UART bring-up
+    //
+    // Stage A only listens to PA1616S TX on GP1 / UART0 RX and prints raw NMEA
+    // sentences through defmt. GP0 remains reserved for Pico -> GPS TX later.
+    // -------------------------------------------------------------------------
+
+    spawner.spawn(
+        gps::receive_task(
+            p.UART0, p.PIN_1, // GPS TX -> Pico UART0 RX
+        )
+        .expect("failed to create GPS receive task"),
     );
 
     // -------------------------------------------------------------------------
