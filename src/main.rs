@@ -1,51 +1,80 @@
 #![no_std]
 #![no_main]
 
-use defmt::{error, info};
+use core::fmt::Write as _;
+
+use defmt::{error, info, warn};
 use defmt_rtt as _;
 
 use embassy_executor::Spawner;
 use embassy_rp::{
     bind_interrupts, dma,
     gpio::{Input, Level, Output, Pull},
+    i2c::{Config as I2cConfig, I2c},
     peripherals::{DMA_CH0, DMA_CH1},
     spi::{Config as SpiConfig, Spi},
 };
-use embassy_time::{Delay, Timer};
-
-use embedded_hal_bus::spi::ExclusiveDevice;
-
-use lora_phy::{
-    LoRa, RxMode,
-    iv::GenericSx126xInterfaceVariant,
-    mod_params::{Bandwidth, CodingRate, SpreadingFactor},
-    sx126x::{self, Sx126x, Sx1262, TcxoCtrlVoltage},
-};
-
-use panic_probe as _;
-
-use core::fmt::Write as _;
-
-use embassy_rp::i2c::{Config as I2cConfig, I2c};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 
 use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_6X10},
+    mono_font::{ascii::FONT_6X10, MonoTextStyle},
     pixelcolor::BinaryColor,
     prelude::*,
     text::{Baseline, Text},
 };
+use embedded_hal_bus::spi::ExclusiveDevice;
 
 use heapless::String;
 
-use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
+use lora_phy::{
+    iv::GenericSx126xInterfaceVariant,
+    mod_params::{Bandwidth, CodingRate, SpreadingFactor},
+    sx126x::{self, Sx1262, Sx126x, TcxoCtrlVoltage},
+    LoRa, RxMode,
+};
+
+use panic_probe as _;
+
+use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 
 const LORA_FREQUENCY_HZ: u32 = 915_000_000;
+
+// The current nRF beacon increments its sequence once per second.
+const BEACON_SEQUENCE_RATE_HZ: u64 = 1;
+
+// If no packet arrives for this long, show LINK LOST on the OLED.
+const LINK_LOSS_TIMEOUT_SECS: u64 = 5;
+
+// Extra slack when deciding whether a forward sequence jump is physically
+// plausible for a 1 Hz beacon. This protects the missed-packet counter from
+// corrupted sequence bytes near the edge of reception.
+const SEQUENCE_GAP_TOLERANCE: u64 = 5;
+
+// If the transmitter reboots, its sequence starts near zero. A small backward
+// jump into this window is treated as a beacon restart rather than corruption.
+const REBOOT_SEQUENCE_WINDOW: u32 = 10;
+
+// Current test-packet magic from the nRF beacon.
+const PACKET_MAGIC: &[u8; 4] = b"MRU1";
 
 bind_interrupts!(struct Irqs {
     DMA_IRQ_0 =>
         dma::InterruptHandler<DMA_CH0>,
         dma::InterruptHandler<DMA_CH1>;
 });
+
+fn decode_sequence(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 10 || &payload[0..4] != PACKET_MAGIC {
+        return None;
+    }
+
+    Some(u32::from_le_bytes([
+        payload[6],
+        payload[7],
+        payload[8],
+        payload[9],
+    ]))
+}
 
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
@@ -55,7 +84,7 @@ async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     // Pico 2 onboard LED.
-    // In RX mode we'll pulse this briefly whenever a packet arrives.
+    // Pulses briefly whenever a valid packet is accepted.
     let mut led = Output::new(p.PIN_25, Level::Low);
 
     info!("LORAMv1 online");
@@ -79,8 +108,12 @@ async fn main(_spawner: Spawner) {
 
     let interface = I2CDisplayInterface::new(i2c);
 
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
+    let mut display = Ssd1306::new(
+        interface,
+        DisplaySize128x64,
+        DisplayRotation::Rotate0,
+    )
+    .into_buffered_graphics_mode();
 
     display.init().unwrap();
 
@@ -149,7 +182,8 @@ async fn main(_spawner: Spawner) {
     // SX1262 interface
     // -------------------------------------------------------------------------
 
-    let interface = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
+    let interface =
+        GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
 
     let radio_config = sx126x::Config {
         chip: Sx1262,
@@ -188,7 +222,7 @@ async fn main(_spawner: Spawner) {
     // -------------------------------------------------------------------------
     // LoRa modulation parameters
     //
-    // These exactly match the nRF52840 transmitter:
+    // These exactly match the current nRF52840 transmitter:
     //
     // 915 MHz
     // SF7
@@ -222,8 +256,6 @@ async fn main(_spawner: Spawner) {
     // explicit header
     // CRC enabled
     // normal IQ
-    //
-    // RX additionally specifies the maximum payload length.
     // -------------------------------------------------------------------------
 
     let mut rx_buffer = [0u8; 255];
@@ -254,7 +286,11 @@ async fn main(_spawner: Spawner) {
     info!("Preparing continuous RX...");
 
     match lora
-        .prepare_for_rx(RxMode::Continuous, &modulation_params, &rx_packet_params)
+        .prepare_for_rx(
+            RxMode::Continuous,
+            &modulation_params,
+            &rx_packet_params,
+        )
         .await
     {
         Ok(()) => {
@@ -271,98 +307,269 @@ async fn main(_spawner: Spawner) {
     }
 
     // -------------------------------------------------------------------------
-    // Receive packets forever
+    // Receiver state
     // -------------------------------------------------------------------------
 
     let mut last_sequence: Option<u32> = None;
+    let mut last_valid_rx_time: Option<Instant> = None;
+
     let mut received_packets: u32 = 0;
     let mut missed_packets: u32 = 0;
+
+    let mut last_rssi: Option<i16> = None;
+    let mut last_snr: Option<i16> = None;
+
+    let mut link_lost_displayed = false;
+
+    // -------------------------------------------------------------------------
+    // Receive packets forever
+    // -------------------------------------------------------------------------
 
     loop {
         rx_buffer.fill(0);
 
-        match lora.rx(&rx_packet_params, &mut rx_buffer).await {
-            Ok((received_len, packet_status)) => {
+        let rx_result = with_timeout(
+            Duration::from_secs(LINK_LOSS_TIMEOUT_SECS),
+            lora.rx(&rx_packet_params, &mut rx_buffer),
+        )
+        .await;
+
+        match rx_result {
+            // -----------------------------------------------------------------
+            // Radio returned a packet/result before the link-loss timeout.
+            // -----------------------------------------------------------------
+            Ok(Ok((received_len, packet_status))) => {
                 let len = received_len as usize;
 
-                info!("RX packet!");
-                info!("Length: {}", received_len);
-                info!("RSSI: {} dBm", packet_status.rssi);
-                info!("SNR: {} dB", packet_status.snr);
+                let Some(sequence) = decode_sequence(&rx_buffer[..len]) else {
+                    warn!(
+                        "Ignoring invalid/unknown packet: len={}",
+                        received_len
+                    );
+                    continue;
+                };
 
-                if len >= 10 && &rx_buffer[0..4] == b"MRU1" {
-                    let sequence = u32::from_le_bytes([
-                        rx_buffer[6],
-                        rx_buffer[7],
-                        rx_buffer[8],
-                        rx_buffer[9],
-                    ]);
+                let now = Instant::now();
 
-                    received_packets += 1;
+                // -------------------------------------------------------------
+                // Sequence validation / packet-loss accounting
+                //
+                // We deliberately validate the sequence BEFORE updating counters
+                // or last_sequence. This prevents one corrupted sequence field
+                // from poisoning the rest of the test.
+                // -------------------------------------------------------------
 
-                    if let Some(last) = last_sequence {
-                        let expected = last.wrapping_add(1);
-
-                        if sequence == expected {
-                            // Perfectly sequential packet.
-                        } else if sequence == last {
-                            info!("Duplicate packet: seq={}", sequence);
-                        } else if sequence > last {
-                            let missed = sequence - last - 1;
-
-                            missed_packets += missed;
-
-                            info!(
-                                "PACKET LOSS: missed {} packet(s) between seq={} and seq={}",
-                                missed, last, sequence
-                            );
-                        } else {
-                            // Most likely transmitter reboot/reset rather than billions
-                            // of suddenly-lost packets.
-                            info!(
-                                "Sequence reset/out-of-order: last={} current={}",
-                                last, sequence
-                            );
-                        }
+                if let Some(last) = last_sequence {
+                    if sequence == last {
+                        warn!("Ignoring duplicate packet: seq={}", sequence);
+                        continue;
                     }
 
-                    last_sequence = Some(sequence);
+                    if sequence > last {
+                        let sequence_gap = sequence - last;
 
-                    // -------------------------------------------------------------------------
-                    // Update OLED
-                    // -------------------------------------------------------------------------
+                        // The beacon increments once per second, so compare the
+                        // observed jump against the actual time since the last
+                        // valid packet, plus a little tolerance.
+                        let elapsed_secs = last_valid_rx_time
+                            .map(|last_time| now.duration_since(last_time).as_secs())
+                            .unwrap_or(0);
 
-                    display.clear(BinaryColor::Off).unwrap();
+                        let max_plausible_gap = elapsed_secs
+                            .saturating_mul(BEACON_SEQUENCE_RATE_HZ)
+                            .saturating_add(SEQUENCE_GAP_TOLERANCE)
+                            .max(1);
 
-                    let mut line: String<32> = String::new();
+                        if u64::from(sequence_gap) > max_plausible_gap {
+                            warn!(
+                                "Ignoring implausible sequence jump: last={} current={} gap={} max_plausible={}",
+                                last,
+                                sequence,
+                                sequence_gap,
+                                max_plausible_gap
+                            );
+                            continue;
+                        }
 
-                    // Header
-                    Text::with_baseline(
-                        "LORAM RECEIVER",
-                        Point::new(0, 0),
-                        text_style,
-                        Baseline::Top,
-                    )
-                    .draw(&mut display)
-                    .unwrap();
+                        let newly_missed = sequence_gap - 1;
 
-                    // Sequence
-                    write!(&mut line, "SEQ  {}", sequence).unwrap();
+                        if newly_missed > 0 {
+                            missed_packets = missed_packets.saturating_add(newly_missed);
 
-                    Text::with_baseline(
-                        line.as_str(),
-                        Point::new(0, 12),
-                        text_style,
-                        Baseline::Top,
-                    )
-                    .draw(&mut display)
-                    .unwrap();
+                            warn!(
+                                "PACKET LOSS: missed {} packet(s) between seq={} and seq={}",
+                                newly_missed,
+                                last,
+                                sequence
+                            );
+                        }
+                    } else {
+                        // A real transmitter reboot should restart the sequence
+                        // close to zero. Accept that small reset; reject other
+                        // backward jumps as out-of-order/corrupted data.
+                        if sequence <= REBOOT_SEQUENCE_WINDOW {
+                            warn!(
+                                "Beacon sequence reset detected: last={} current={}",
+                                last,
+                                sequence
+                            );
+                        } else {
+                            warn!(
+                                "Ignoring backward/out-of-order sequence: last={} current={}",
+                                last,
+                                sequence
+                            );
+                            continue;
+                        }
+                    }
+                }
 
-                    line.clear();
+                // Packet is now considered valid and accepted.
+                received_packets = received_packets.saturating_add(1);
+                last_sequence = Some(sequence);
+                last_valid_rx_time = Some(now);
+                last_rssi = Some(packet_status.rssi);
+                last_snr = Some(packet_status.snr);
+                link_lost_displayed = false;
 
-                    // RSSI
-                    write!(&mut line, "RSSI {} dBm", packet_status.rssi).unwrap();
+                info!(
+                    "RX seq={} RSSI={} dBm SNR={} dB | received={} missed={}",
+                    sequence,
+                    packet_status.rssi,
+                    packet_status.snr,
+                    received_packets,
+                    missed_packets
+                );
 
+                // -------------------------------------------------------------
+                // Update OLED with live receiver data.
+                // -------------------------------------------------------------
+
+                display.clear(BinaryColor::Off).unwrap();
+
+                let mut line: String<32> = String::new();
+
+                Text::with_baseline(
+                    "LORAM RECEIVER",
+                    Point::new(0, 0),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                write!(&mut line, "SEQ  {}", sequence).unwrap();
+                Text::with_baseline(
+                    line.as_str(),
+                    Point::new(0, 12),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                line.clear();
+
+                write!(&mut line, "RSSI {} dBm", packet_status.rssi).unwrap();
+                Text::with_baseline(
+                    line.as_str(),
+                    Point::new(0, 24),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                line.clear();
+
+                write!(&mut line, "SNR  {} dB", packet_status.snr).unwrap();
+                Text::with_baseline(
+                    line.as_str(),
+                    Point::new(0, 36),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                line.clear();
+
+                write!(
+                    &mut line,
+                    "RX {} MISS {}",
+                    received_packets,
+                    missed_packets
+                )
+                .unwrap();
+                Text::with_baseline(
+                    line.as_str(),
+                    Point::new(0, 48),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                display.flush().unwrap();
+
+                // Brief visible indication of an accepted packet.
+                led.set_high();
+                Timer::after_millis(75).await;
+                led.set_low();
+            }
+
+            // -----------------------------------------------------------------
+            // The radio itself returned an RX error.
+            // -----------------------------------------------------------------
+            Ok(Err(err)) => {
+                error!("RX error: {}", err);
+            }
+
+            // -----------------------------------------------------------------
+            // No RX result for LINK_LOSS_TIMEOUT_SECS.
+            // -----------------------------------------------------------------
+            Err(_) => {
+                // Before the first valid packet, keep the startup
+                // "Waiting for RX..." screen rather than calling it a lost link.
+                if last_sequence.is_none() {
+                    continue;
+                }
+
+                // Only redraw once per outage. When a valid packet returns,
+                // link_lost_displayed is cleared and the live screen returns.
+                if link_lost_displayed {
+                    continue;
+                }
+
+                warn!(
+                    "LINK LOST: no valid packet for {} seconds",
+                    LINK_LOSS_TIMEOUT_SECS
+                );
+
+                display.clear(BinaryColor::Off).unwrap();
+
+                let mut line: String<32> = String::new();
+
+                Text::with_baseline(
+                    "LORAM RECEIVER",
+                    Point::new(0, 0),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                Text::with_baseline(
+                    "!!! LINK LOST !!!",
+                    Point::new(0, 12),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                if let Some(sequence) = last_sequence {
+                    write!(&mut line, "LAST SEQ {}", sequence).unwrap();
                     Text::with_baseline(
                         line.as_str(),
                         Point::new(0, 24),
@@ -373,10 +580,10 @@ async fn main(_spawner: Spawner) {
                     .unwrap();
 
                     line.clear();
+                }
 
-                    // SNR
-                    write!(&mut line, "SNR  {} dB", packet_status.snr).unwrap();
-
+                if let (Some(rssi), Some(snr)) = (last_rssi, last_snr) {
+                    write!(&mut line, "RSSI {} SNR {}", rssi, snr).unwrap();
                     Text::with_baseline(
                         line.as_str(),
                         Point::new(0, 36),
@@ -387,36 +594,27 @@ async fn main(_spawner: Spawner) {
                     .unwrap();
 
                     line.clear();
-
-                    // Packet stats
-                    write!(&mut line, "RX {} MISS {}", received_packets, missed_packets).unwrap();
-
-                    Text::with_baseline(
-                        line.as_str(),
-                        Point::new(0, 48),
-                        text_style,
-                        Baseline::Top,
-                    )
-                    .draw(&mut display)
-                    .unwrap();
-
-                    display.flush().unwrap();
-
-                    info!(
-                        "RX seq={} RSSI={} dBm SNR={} dB | received={} missed={}",
-                        sequence,
-                        packet_status.rssi,
-                        packet_status.snr,
-                        received_packets,
-                        missed_packets
-                    );
-                } else {
-                    error!("Invalid or unknown packet");
                 }
-            }
 
-            Err(err) => {
-                error!("RX error: {}", err);
+                write!(
+                    &mut line,
+                    "RX {} MISS {}",
+                    received_packets,
+                    missed_packets
+                )
+                .unwrap();
+                Text::with_baseline(
+                    line.as_str(),
+                    Point::new(0, 48),
+                    text_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                display.flush().unwrap();
+
+                link_lost_displayed = true;
             }
         }
     }
