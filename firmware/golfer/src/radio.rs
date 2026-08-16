@@ -1,13 +1,10 @@
 use defmt::{error, info};
 
 use embassy_rp::{
-    bind_interrupts, dma,
+    Peri, bind_interrupts, dma,
     gpio::{Input, Level, Output, Pull},
-    peripherals::{
-        DMA_CH0, DMA_CH1, PIN_2, PIN_3, PIN_10, PIN_11, PIN_12, PIN_15, PIN_20, SPI1,
-    },
+    peripherals::{DMA_CH0, DMA_CH1, PIN_2, PIN_3, PIN_10, PIN_11, PIN_12, PIN_15, PIN_20, SPI1},
     spi::{Async, Config as SpiConfig, Spi},
-    Peri,
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::Delay;
@@ -15,13 +12,13 @@ use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 use lora_phy::{
+    LoRa, RxMode,
     iv::GenericSx126xInterfaceVariant,
     mod_params::{
         Bandwidth, CodingRate, ModulationParams, PacketParams, PacketStatus, RadioError,
         SpreadingFactor,
     },
-    sx126x::{self, Sx1262, Sx126x, TcxoCtrlVoltage},
-    LoRa, RxMode,
+    sx126x::{self, Sx126x, Sx1262, TcxoCtrlVoltage},
 };
 
 pub const RX_BUFFER_SIZE: usize = 255;
@@ -73,7 +70,7 @@ pub struct Radio {
 
 impl Radio {
     /// Initialize the Waveshare Pico-LoRa-SX1262 using the currently proven
-    /// LORAM v1 SF7 baseline and enter continuous RX mode.
+    /// GOLFER SF7 baseline and enter continuous RX mode.
     pub async fn new(
         spi1: Peri<'static, SPI1>,
         sck: Peri<'static, PIN_10>,
@@ -125,8 +122,7 @@ impl Radio {
         // SX1262 interface
         // ---------------------------------------------------------------------
 
-        let interface =
-            GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
+        let interface = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
 
         let radio_config = sx126x::Config {
             chip: Sx1262,
@@ -155,7 +151,7 @@ impl Radio {
         };
 
         // ---------------------------------------------------------------------
-        // Proven LORAM v1 baseline:
+        // Proven GOLFER baseline:
         //
         // 915 MHz
         // SF7
@@ -207,18 +203,14 @@ impl Radio {
         info!("Preparing continuous RX...");
 
         if let Err(err) = lora
-            .prepare_for_rx(
-                RxMode::Continuous,
-                &modulation_params,
-                &rx_packet_params,
-            )
+            .prepare_for_rx(RxMode::Continuous, &modulation_params, &rx_packet_params)
             .await
         {
             error!("Failed to prepare RX: {}", err);
             return Err(err);
         }
 
-        info!("LORAMv1 RX READY");
+        info!("GOLFER RX READY");
 
         Ok(Self {
             lora,
@@ -228,10 +220,7 @@ impl Radio {
     }
 
     /// Wait for and receive the next LoRa packet.
-    pub async fn receive(
-        &mut self,
-        buffer: &mut [u8],
-    ) -> Result<(u8, PacketStatus), RadioError> {
+    pub async fn receive(&mut self, buffer: &mut [u8]) -> Result<(u8, PacketStatus), RadioError> {
         self.lora.rx(&self.rx_packet_params, buffer).await
     }
 }
@@ -263,4 +252,3 @@ pub async fn receive_task(mut radio: Radio) {
         }
     }
 }
-

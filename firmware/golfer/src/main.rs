@@ -68,7 +68,7 @@ async fn main(spawner: Spawner) {
     // Pulses briefly whenever a valid packet is accepted.
     let mut led = Output::new(p.PIN_25, Level::Low);
 
-    info!("LORAMv1 online");
+    info!("GOLFER firmware is online!");
 
     // -------------------------------------------------------------------------
     // Display
@@ -84,7 +84,8 @@ async fn main(spawner: Spawner) {
     // -------------------------------------------------------------------------
 
     let mut display = Display::new(
-        p.SPI0, p.PIN_18, // SCK
+        p.SPI0,
+        p.PIN_18, // SCK
         p.PIN_19, // MOSI
         p.PIN_16, // MISO
         p.PIN_17, // TFT CS

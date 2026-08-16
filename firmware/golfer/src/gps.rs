@@ -1,16 +1,12 @@
 use defmt::{error, info, warn};
 
 use embassy_rp::{
-    bind_interrupts,
+    Peri, bind_interrupts,
     peripherals::{PIN_1, UART0},
     uart::{BufferedInterruptHandler, BufferedUartRx, Config as UartConfig},
-    Peri,
 };
 
-use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex,
-    signal::Signal,
-};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 
 use embedded_io_async::Read;
 
@@ -53,9 +49,7 @@ impl GpsState {
 /// A Signal is intentional here: GPS position is state, not an event stream.
 /// If the consumer has not yet taken the previous value, a newer fix may
 /// replace it. main.rs only needs the newest position for the display.
-pub static GPS_STATE_SIGNAL:
-    Signal<CriticalSectionRawMutex, GpsState> =
-    Signal::new();
+pub static GPS_STATE_SIGNAL: Signal<CriticalSectionRawMutex, GpsState> = Signal::new();
 
 /// PA1616S receive / parse task.
 ///
@@ -69,22 +63,13 @@ pub static GPS_STATE_SIGNAL:
 /// Pico GP0 remains reserved for GPS RX when we later add outbound
 /// configuration commands.
 #[embassy_executor::task]
-pub async fn receive_task(
-    uart0: Peri<'static, UART0>,
-    rx_pin: Peri<'static, PIN_1>,
-) {
+pub async fn receive_task(uart0: Peri<'static, UART0>, rx_pin: Peri<'static, PIN_1>) {
     let mut config = UartConfig::default();
     config.baudrate = GPS_BAUDRATE;
 
     let rx_buffer = UART_RX_BUFFER.init([0u8; UART_RX_BUFFER_SIZE]);
 
-    let mut uart = BufferedUartRx::new(
-        uart0,
-        Irqs,
-        rx_pin,
-        rx_buffer,
-        config,
-    );
+    let mut uart = BufferedUartRx::new(uart0, Irqs, rx_pin, rx_buffer, config);
 
     info!("GPS UART online: UART0 RX on GP1 @ 9600 baud");
     info!("Waiting for PA1616S NMEA data...");
@@ -138,7 +123,7 @@ pub async fn receive_task(
     }
 }
 
-/// Parse the minimum GGA state LORAM v1 currently needs:
+/// Parse the minimum GGA state GOLFER currently needs:
 /// fix validity, latitude, longitude, and satellites used.
 ///
 /// Both GP and GN talker IDs are accepted so the parser is not coupled to a
@@ -171,10 +156,8 @@ fn parse_gga(line: &str) -> Option<GpsState> {
         });
     }
 
-    let latitude_e7 =
-        parse_coordinate_e7(latitude, latitude_hemisphere)?;
-    let longitude_e7 =
-        parse_coordinate_e7(longitude, longitude_hemisphere)?;
+    let latitude_e7 = parse_coordinate_e7(latitude, latitude_hemisphere)?;
+    let longitude_e7 = parse_coordinate_e7(longitude, longitude_hemisphere)?;
 
     Some(GpsState {
         online: true,
@@ -198,10 +181,7 @@ fn parse_u8(value: &str) -> Option<u8> {
 ///     348591150  ==  34.8591150 degrees
 ///
 /// This intentionally avoids floating-point parsing.
-fn parse_coordinate_e7(
-    coordinate: &str,
-    hemisphere: &str,
-) -> Option<i32> {
+fn parse_coordinate_e7(coordinate: &str, hemisphere: &str) -> Option<i32> {
     let bytes = coordinate.as_bytes();
 
     let decimal_index = bytes
@@ -217,8 +197,7 @@ fn parse_coordinate_e7(
     let degree_digits = decimal_index - 2;
 
     let degrees = parse_digits(&bytes[..degree_digits])?;
-    let whole_minutes =
-        parse_digits(&bytes[degree_digits..decimal_index])?;
+    let whole_minutes = parse_digits(&bytes[degree_digits..decimal_index])?;
 
     if whole_minutes >= 60 {
         return None;
@@ -273,9 +252,7 @@ fn parse_digits(bytes: &[u8]) -> Option<u32> {
             return None;
         }
 
-        value = value
-            .checked_mul(10)?
-            .checked_add(u32::from(byte - b'0'))?;
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
     }
 
     Some(value)
@@ -301,9 +278,7 @@ fn scale_fraction_to_e7(bytes: &[u8]) -> Option<u32> {
         }
 
         if digits_used < 7 {
-            value = value
-                .checked_mul(10)?
-                .checked_add(u32::from(byte - b'0'))?;
+            value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
 
             digits_used += 1;
         }
@@ -327,18 +302,12 @@ fn log_state(state: GpsState) {
         (true, Some(latitude), Some(longitude), Some(satellites)) => {
             info!(
                 "GPS FIX: lat_e7={} lon_e7={} sats={}",
-                latitude,
-                longitude,
-                satellites
+                latitude, longitude, satellites
             );
         }
 
         (true, Some(latitude), Some(longitude), None) => {
-            info!(
-                "GPS FIX: lat_e7={} lon_e7={} sats=?",
-                latitude,
-                longitude
-            );
+            info!("GPS FIX: lat_e7={} lon_e7={} sats=?", latitude, longitude);
         }
 
         (_, _, _, Some(satellites)) => {
