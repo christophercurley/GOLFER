@@ -11,6 +11,8 @@ use embedded_graphics::{
 };
 use heapless::String;
 
+use crate::system::{SystemConfig, SystemInfo};
+
 use super::{
     GpsDisplayState,
     RadioDisplayState,
@@ -50,6 +52,86 @@ const GPS_Y: i32 = 166;
 const SAT_Y: i32 = 182;
 const LAT_Y: i32 = 198;
 const LON_Y: i32 = 214;
+
+
+// -----------------------------------------------------------------------------
+// BOOT SCREEN
+// -----------------------------------------------------------------------------
+
+pub fn draw_boot<D>(
+    target: &mut D,
+    info: &SystemInfo,
+    config: &SystemConfig,
+)
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: Debug,
+{
+    let style = text_style();
+
+    draw_text(target, "GOLFER", Point::new(4, 12), style);
+    draw_text(target, "SYSTEM INITIALIZATION", Point::new(4, 28), style);
+
+    let mut label: String<32> = String::new();
+
+    write!(
+        &mut label,
+        "NAME [{}]",
+        config.name.access.tag()
+    )
+    .unwrap();
+    draw_text(target, label.as_str(), Point::new(4, 60), style);
+    draw_text(
+        target,
+        config.name.value.as_str(),
+        Point::new(4, 76),
+        style,
+    );
+
+    label.clear();
+    write!(
+        &mut label,
+        "SYSTEM ID [{}]",
+        info.system_id.access.tag()
+    )
+    .unwrap();
+    draw_text(target, label.as_str(), Point::new(4, 108), style);
+
+    let mut system_id: String<16> = String::new();
+    write!(&mut system_id, "{:016X}", info.system_id.value).unwrap();
+    draw_text(target, system_id.as_str(), Point::new(4, 124), style);
+
+    let mut line: String<40> = String::new();
+
+    write!(
+        &mut line,
+        "FIRMWARE  {} [{}]",
+        info.firmware_version.value,
+        info.firmware_version.access.tag()
+    )
+    .unwrap();
+    draw_text(target, line.as_str(), Point::new(4, 172), style);
+
+    line.clear();
+    write!(
+        &mut line,
+        "PROTOCOL  {} [{}]",
+        info.protocol_version.value,
+        info.protocol_version.access.tag()
+    )
+    .unwrap();
+    draw_text(target, line.as_str(), Point::new(4, 188), style);
+
+    line.clear();
+    write!(
+        &mut line,
+        "CONFIG    {} [{}]",
+        info.config_version.value,
+        info.config_version.access.tag()
+    )
+    .unwrap();
+    draw_text(target, line.as_str(), Point::new(4, 204), style);
+}
 
 pub fn clear_screen<D>(target: &mut D)
 where

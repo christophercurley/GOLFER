@@ -1,6 +1,8 @@
 mod backend;
 mod ui;
 
+use crate::system::{SystemConfig, SystemInfo};
+
 use embassy_rp::{
     peripherals::{
         PIN_13, PIN_14, PIN_16, PIN_17, PIN_18, PIN_19, PIN_21, SPI0,
@@ -12,6 +14,7 @@ pub use backend::TFT_SPI_FREQUENCY_HZ;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DisplayPage {
+    Boot,
     General,
 }
 
@@ -107,6 +110,8 @@ impl GpsDisplayState {
 pub struct Display {
     backend: backend::Backend,
     page: DisplayPage,
+    system_info: SystemInfo,
+    system_config: SystemConfig,
     radio: RadioDisplayState,
     gps: GpsDisplayState,
 }
@@ -122,6 +127,8 @@ impl Display {
         dc: Peri<'static, PIN_13>,
         reset: Peri<'static, PIN_14>,
         backlight: Peri<'static, PIN_21>,
+        system_info: SystemInfo,
+        system_config: SystemConfig,
     ) -> Self {
         let backend = backend::Backend::new(
             spi0,
@@ -136,7 +143,9 @@ impl Display {
 
         let mut display = Self {
             backend,
-            page: DisplayPage::General,
+            page: DisplayPage::Boot,
+            system_info,
+            system_config,
             radio: RadioDisplayState::waiting(),
             gps: GpsDisplayState::offline(),
         };
@@ -224,6 +233,11 @@ impl Display {
         let target = self.backend.target();
 
         match self.page {
+            DisplayPage::Boot => {
+                ui::clear_screen(target);
+                ui::draw_boot(target, &self.system_info, &self.system_config);
+            }
+
             DisplayPage::General => {
                 ui::clear_screen(target);
                 ui::draw_general_static(target);

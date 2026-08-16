@@ -13,8 +13,13 @@ use panic_probe as _;
 mod display;
 mod gps;
 mod radio;
+mod system;
 
-use display::{Display, GpsDisplayState, RadioDisplayState};
+use display::{Display, DisplayPage, GpsDisplayState, RadioDisplayState};
+
+// How long the startup system-information page remains visible.
+// This is intentionally generous for bring-up and will be shortened later.
+const BOOT_SCREEN_DURATION_SECS: u64 = 10;
 
 // The current nRF beacon increments its sequence once per second.
 const BEACON_SEQUENCE_RATE_HZ: u64 = 1;
@@ -55,6 +60,10 @@ fn decode_sequence(payload: &[u8]) -> Option<u32> {
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
+    // Establish this physical GOLFER's immutable hardware-derived identity.
+    // The resulting SystemInfo is also the data source for the boot screen.
+    let system = system::init(p.FLASH);
+
     // Pico 2 onboard LED.
     // Pulses briefly whenever a valid packet is accepted.
     let mut led = Output::new(p.PIN_25, Level::Low);
@@ -82,7 +91,19 @@ async fn main(spawner: Spawner) {
         p.PIN_13, // TFT DC/RS
         p.PIN_14, // TFT RESET
         p.PIN_21, // TFT backlight
+        system.info(),
+        system.config().clone(),
     );
+
+    info!(
+        "Boot screen active for {} seconds",
+        BOOT_SCREEN_DURATION_SECS
+    );
+
+    Timer::after_secs(BOOT_SCREEN_DURATION_SECS).await;
+
+    display.set_page(DisplayPage::General);
+    info!("Boot screen complete; entering general display");
 
     // -------------------------------------------------------------------------
     // GPS
