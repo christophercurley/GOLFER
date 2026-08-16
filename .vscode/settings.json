@@ -1,0 +1,4 @@
+{
+    // kill the annoying error in main.rs
+    "rust-analyzer.check.allTargets": false
+}

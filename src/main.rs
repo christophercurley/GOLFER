@@ -6,7 +6,7 @@ use defmt_rtt as _;
 
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
-use embassy_time::{with_timeout, Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 
 use panic_probe as _;
 
@@ -14,17 +14,7 @@ mod display;
 mod gps;
 mod radio;
 
-use display::{Display, DisplayPage, GpsDisplayState, RadioDisplayState};
-
-// Temporary page selection for the current 0.96" OLED.
-//
-// Until a physical UI control exists, changing this one line is enough to boot
-// directly into the radio or GPS page. display.rs already supports runtime
-// set_page()/toggle_page() for later hardware.
-const INITIAL_DISPLAY_PAGE: DisplayPage = DisplayPage::Gps;
-
-// Temporary automatic page rotation for the development OLED.
-const DISPLAY_PAGE_INTERVAL_SECS: u64 = 10;
+use display::{Display, GpsDisplayState, RadioDisplayState};
 
 // The current nRF beacon increments its sequence once per second.
 const BEACON_SEQUENCE_RATE_HZ: u64 = 1;
@@ -54,10 +44,7 @@ fn decode_sequence(payload: &[u8]) -> Option<u32> {
     }
 
     Some(u32::from_le_bytes([
-        payload[6],
-        payload[7],
-        payload[8],
-        payload[9],
+        payload[6], payload[7], payload[8], payload[9],
     ]))
 }
 
@@ -77,16 +64,24 @@ async fn main(spawner: Spawner) {
     // -------------------------------------------------------------------------
     // Display
     //
-    // OLED hardware setup and all rendering now live in display.rs.
-    // GP4 = SDA
-    // GP5 = SCL
+    // ILI9341 TFT on SPI0, native portrait orientation (240 x 320).
+    // GP16 = MISO
+    // GP17 = TFT CS
+    // GP18 = SCK
+    // GP19 = MOSI
+    // GP13 = DC/RS
+    // GP14 = RESET
+    // GP21 = backlight enable (PWM later)
     // -------------------------------------------------------------------------
 
     let mut display = Display::new(
-        p.I2C0,
-        p.PIN_5, // SCL
-        p.PIN_4, // SDA
-        INITIAL_DISPLAY_PAGE,
+        p.SPI0, p.PIN_18, // SCK
+        p.PIN_19, // MOSI
+        p.PIN_16, // MISO
+        p.PIN_17, // TFT CS
+        p.PIN_13, // TFT DC/RS
+        p.PIN_14, // TFT RESET
+        p.PIN_21, // TFT backlight
     );
 
     // -------------------------------------------------------------------------
@@ -99,8 +94,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(
         gps::receive_task(
-            p.UART0,
-            p.PIN_1, // GPS TX -> Pico UART0 RX
+            p.UART0, p.PIN_1, // GPS TX -> Pico UART0 RX
         )
         .expect("failed to create GPS receive task"),
     );
@@ -114,13 +108,10 @@ async fn main(spawner: Spawner) {
     // -------------------------------------------------------------------------
 
     let radio = match radio::Radio::new(
-        p.SPI1,
-        p.PIN_10, // SCK
+        p.SPI1, p.PIN_10, // SCK
         p.PIN_11, // MOSI
         p.PIN_12, // MISO
-        p.DMA_CH0,
-        p.DMA_CH1,
-        p.PIN_3,  // NSS / CS
+        p.DMA_CH0, p.DMA_CH1, p.PIN_3,  // NSS / CS
         p.PIN_15, // RESET
         p.PIN_20, // DIO1
         p.PIN_2,  // BUSY
@@ -144,10 +135,7 @@ async fn main(spawner: Spawner) {
 
     // The SX1262 receive future now lives permanently inside its own task.
     // The application only waits on RX_CHANNEL, which is safe to timeout.
-    spawner.spawn(
-        radio::receive_task(radio)
-            .expect("failed to create radio receive task"),
-    );
+    spawner.spawn(radio::receive_task(radio).expect("failed to create radio receive task"));
 
     // -------------------------------------------------------------------------
     // Receiver state
@@ -164,31 +152,11 @@ async fn main(spawner: Spawner) {
 
     let mut link_lost_displayed = false;
 
-    let mut last_display_page_switch = Instant::now();
-
     // -------------------------------------------------------------------------
     // Receive packets forever
     // -------------------------------------------------------------------------
 
     loop {
-        // ---------------------------------------------------------------------
-        // Temporary development UI: alternate GPS and radio pages every 10 s.
-        //
-        // main.rs only decides *when* to switch. display.rs still owns the
-        // actual page rendering and remembers the latest state for both pages.
-        // ---------------------------------------------------------------------
-
-        let now = Instant::now();
-
-        if now
-            .duration_since(last_display_page_switch)
-            .as_secs()
-            >= DISPLAY_PAGE_INTERVAL_SECS
-        {
-            display.toggle_page();
-            last_display_page_switch = now;
-        }
-
         // ---------------------------------------------------------------------
         // Consume the newest GPS state, if one has arrived.
         //
@@ -261,10 +229,7 @@ async fn main(spawner: Spawner) {
                         if u64::from(sequence_gap) > max_plausible_gap {
                             warn!(
                                 "Ignoring implausible sequence jump: last={} current={} gap={} max_plausible={}",
-                                last,
-                                sequence,
-                                sequence_gap,
-                                max_plausible_gap
+                                last, sequence, sequence_gap, max_plausible_gap
                             );
                             continue;
                         }
@@ -276,9 +241,7 @@ async fn main(spawner: Spawner) {
 
                             warn!(
                                 "PACKET LOSS: missed {} packet(s) between seq={} and seq={}",
-                                newly_missed,
-                                last,
-                                sequence
+                                newly_missed, last, sequence
                             );
                         }
                     } else {
@@ -288,14 +251,12 @@ async fn main(spawner: Spawner) {
                         if sequence <= REBOOT_SEQUENCE_WINDOW {
                             warn!(
                                 "Beacon sequence reset detected: last={} current={}",
-                                last,
-                                sequence
+                                last, sequence
                             );
                         } else {
                             warn!(
                                 "Ignoring backward/out-of-order sequence: last={} current={}",
-                                last,
-                                sequence
+                                last, sequence
                             );
                             continue;
                         }
@@ -348,9 +309,7 @@ async fn main(spawner: Spawner) {
                     continue;
                 };
 
-                let link_age_secs = Instant::now()
-                    .duration_since(last_rx_time)
-                    .as_secs();
+                let link_age_secs = Instant::now().duration_since(last_rx_time).as_secs();
 
                 if link_age_secs < LINK_LOSS_TIMEOUT_SECS {
                     continue;
@@ -362,10 +321,7 @@ async fn main(spawner: Spawner) {
                     continue;
                 }
 
-                warn!(
-                    "LINK LOST: no valid packet for {} seconds",
-                    link_age_secs
-                );
+                warn!("LINK LOST: no valid packet for {} seconds", link_age_secs);
 
                 display.update_radio(RadioDisplayState::lost(
                     last_sequence,
