@@ -3,27 +3,6 @@
 version = 4
 
 [[package]]
-name = "LORAMv1"
-version = "0.1.0"
-dependencies = [
- "cortex-m-rt",
- "defmt 1.0.1",
- "defmt-rtt",
- "embassy-executor",
- "embassy-rp",
- "embassy-sync",
- "embassy-time",
- "embedded-graphics",
- "embedded-hal-bus",
- "embedded-io-async 0.7.0",
- "heapless 0.9.3",
- "lora-phy",
- "mipidsi",
- "panic-probe",
- "static_cell",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -756,6 +735,31 @@ dependencies = [
  "typenum",
  "version_check",
 ]
+
+[[package]]
+name = "golfer-firmware"
+version = "0.1.0"
+dependencies = [
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-rp",
+ "embassy-sync",
+ "embassy-time",
+ "embedded-graphics",
+ "embedded-hal-bus",
+ "embedded-io-async 0.7.0",
+ "heapless 0.9.3",
+ "lora-phy",
+ "mipidsi",
+ "panic-probe",
+ "static_cell",
+]
+
+[[package]]
+name = "golfer-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "half"

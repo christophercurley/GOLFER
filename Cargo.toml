@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "firmware/golfer",
+    "crates/golfer-protocol",
+]
+
+default-members = [
+    "firmware/golfer",
+]
+
+[profile.release]
+debug = 2
+lto = "thin"
+codegen-units = 1
