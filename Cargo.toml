@@ -2,7 +2,8 @@
 resolver = "2"
 members = [
     "firmware/golfer",
-    "crates/golfer-protocol",
+    "crates/golfer-protocol", 
+	"apps/golfer-cli",
 ]
 
 default-members = [

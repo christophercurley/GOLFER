@@ -737,6 +737,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "golfer-cli"
+version = "0.1.0"
+dependencies = [
+ "golfer-protocol",
+]
+
+[[package]]
 name = "golfer-firmware"
 version = "0.1.0"
 dependencies = [
