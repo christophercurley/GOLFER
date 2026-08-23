@@ -33,6 +33,22 @@ const DEBUG_LOG_FILENAME: &str = "DEBUG.LOG";
 
 // -----------------------------------------------------------------------------
 // PERSISTENT DIAGNOSTIC LOGGING
+//
+// Current DEBUG.LOG wire/text envelope:
+//
+//   <timestamp> <time_source> <uptime_ms> <level> <originator> <event_id> ...
+//
+// Current time placeholders:
+//
+//   timestamp   = NA
+//   time_source = UNKNOWN
+//
+// Example:
+//
+//   NA UNKNOWN 13761 DEBUG STORAGE FS_APPEND_CHECKPOINT us=6636 ...
+//
+// This shape is intentionally parser-friendly and leaves room for the future
+// GOLFER time package without sacrificing the always-available monotonic clock.
 // -----------------------------------------------------------------------------
 
 /// Persistent DEBUG.LOG threshold.
@@ -265,7 +281,9 @@ impl Storage {
     pub fn diag(
         &mut self,
         level: PersistentLogLevel,
-        timestamp_ms: u64,
+        uptime_ms: u64,
+        originator: &'static str,
+        event_id: &'static str,
         args: Arguments<'_>,
     ) {
         if level > PERSISTENT_LOG_LEVEL || self.debug_file.is_none() {
@@ -274,19 +292,42 @@ impl Storage {
 
         let mut line: String<DEBUG_LINE_CAPACITY> = String::new();
 
+        // Persistent diagnostic envelope:
+        //
+        // <timestamp> <time_source> <uptime_ms> <level> <originator>
+        // <event_id> <message...>
+        //
+        // Real wall-clock time is not wired into the logger yet. "NA UNKNOWN"
+        // is an intentional placeholder rather than fabricated UTC.
         if write!(
             line,
-            "{} {} ",
-            timestamp_ms,
+            "NA UNKNOWN {} {} {} {}",
+            uptime_ms,
             level.label(),
+            originator,
+            event_id,
         )
         .is_err()
         {
             return;
         }
 
+        // Many events carry key=value details, but an event may legitimately
+        // have no additional message payload.
+        let before_message_len = line.len();
+
+        if write!(line, " ").is_err() {
+            return;
+        }
+
         if line.write_fmt(args).is_err() {
             return;
+        }
+
+        // Avoid leaving a meaningless trailing separator when the caller used
+        // an empty message.
+        if line.len() == before_message_len + 1 {
+            line.truncate(before_message_len);
         }
 
         if writeln!(line).is_err() {
@@ -402,7 +443,9 @@ impl Storage {
             self.diag(
                 PersistentLogLevel::Error,
                 timestamp_ms,
-                format_args!("FS_APPEND_FAILED"),
+                "STORAGE",
+                "FS_APPEND_FAILED",
+                format_args!(""),
             );
 
             return None;
@@ -431,7 +474,9 @@ impl Storage {
                 self.diag(
                     PersistentLogLevel::Error,
                     timestamp_ms,
-                    format_args!("FS_CHECKPOINT_FAILED"),
+                    "STORAGE",
+                    "FS_CHECKPOINT_FAILED",
+                    format_args!(""),
                 );
 
                 return None;
@@ -453,8 +498,10 @@ impl Storage {
         self.diag(
             PersistentLogLevel::Trace,
             timestamp_ms,
+            "STORAGE",
+            "FS_APPEND",
             format_args!(
-                "FS_APPEND us={} bytes={}",
+                "us={} bytes={}",
                 append_us,
                 line.len()
             ),
@@ -465,8 +512,10 @@ impl Storage {
             self.diag(
                 PersistentLogLevel::Debug,
                 timestamp_ms,
+                "STORAGE",
+                "FS_APPEND_CHECKPOINT",
                 format_args!(
-                    "FS_APPEND_CHECKPOINT us={} append_us={} checkpoint_us={}",
+                    "us={} append_us={} checkpoint_us={}",
                     total_us,
                     append_us,
                     checkpoint_us

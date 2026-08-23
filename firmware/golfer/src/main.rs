@@ -312,8 +312,10 @@ async fn main(spawner: Spawner) {
                             storage.diag(
                                 PersistentLogLevel::Warn,
                                 now.as_millis(),
+                                "RADIO",
+                                "SEQ_CANDIDATE_DUPLICATE",
                                 format_args!(
-                                    "SEQ_CANDIDATE_DUPLICATE seq={} rssi={} snr={}",
+                                    "seq={} rssi={} snr={}",
                                     sequence,
                                     packet_status.rssi,
                                     packet_status.snr
@@ -351,8 +353,10 @@ async fn main(spawner: Spawner) {
                                 storage.diag(
                                     PersistentLogLevel::Info,
                                     now.as_millis(),
+                                    "RADIO",
+                                    "SEQ_RESYNC_CONFIRMED",
                                     format_args!(
-                                        "SEQ_RESYNC_CONFIRMED prev={} candidate={} current={} missed={}",
+                                        "prev={} candidate={} current={} missed={}",
                                         last,
                                         candidate,
                                         sequence,
@@ -371,8 +375,10 @@ async fn main(spawner: Spawner) {
                                 storage.diag(
                                     PersistentLogLevel::Debug,
                                     now.as_millis(),
+                                    "RADIO",
+                                    "SEQ_CANDIDATE_NOT_CONFIRMED",
                                     format_args!(
-                                        "SEQ_CANDIDATE_NOT_CONFIRMED candidate={} next={} trusted_prev={}",
+                                        "candidate={} next={} trusted_prev={}",
                                         candidate,
                                         sequence,
                                         last
@@ -425,8 +431,10 @@ async fn main(spawner: Spawner) {
                                     storage.diag(
                                         PersistentLogLevel::Warn,
                                         now.as_millis(),
+                                        "RADIO",
+                                        "SEQ_SUSPICIOUS",
                                         format_args!(
-                                            "SEQ_SUSPICIOUS prev={} current={} gap={} elapsed_ms={} expected={} max={} rssi={} snr={} raw={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                                            "prev={} current={} gap={} elapsed_ms={} expected={} max={} rssi={} snr={} raw={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
                                             last,
                                             sequence,
                                             sequence_gap,
@@ -481,8 +489,10 @@ async fn main(spawner: Spawner) {
                                     storage.diag(
                                         PersistentLogLevel::Info,
                                         now.as_millis(),
+                                        "RADIO",
+                                        "SEQ_RESET",
                                         format_args!(
-                                            "SEQ_RESET prev={} current={}",
+                                            "prev={} current={}",
                                             last,
                                             sequence
                                         ),
@@ -501,8 +511,10 @@ async fn main(spawner: Spawner) {
                                     storage.diag(
                                         PersistentLogLevel::Warn,
                                         now.as_millis(),
+                                        "RADIO",
+                                        "SEQ_BACKWARD",
                                         format_args!(
-                                            "SEQ_BACKWARD prev={} current={} rssi={} snr={}",
+                                            "prev={} current={} rssi={} snr={}",
                                             last,
                                             sequence,
                                             packet_status.rssi,
