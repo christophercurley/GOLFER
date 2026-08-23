@@ -42,6 +42,7 @@ cortex-m-rt = "0.7"
 lora-phy = { version = "=3.0.1", default-features = false }
 embedded-hal-bus = { version = "=0.3.0", features = ["async"] }
 embedded-io-async = "=0.7.0"
+embedded-sdmmc = { version = "=0.9.0", default-features = false }
 
 # -----------------------------------------------------------------------------
 # Display / UI

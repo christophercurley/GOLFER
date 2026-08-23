@@ -3,12 +3,15 @@ mod ui;
 
 use crate::system::{SystemConfig, SystemInfo};
 
+use core::cell::RefCell;
+
 use embassy_rp::{
-    peripherals::{
-        PIN_13, PIN_14, PIN_16, PIN_17, PIN_18, PIN_19, PIN_21, SPI0,
-    },
+    gpio::Output,
+    peripherals::{PIN_13, PIN_14, PIN_21},
     Peri,
 };
+
+use crate::spi0_bus::Spi0Bus;
 
 pub use backend::TFT_SPI_FREQUENCY_HZ;
 
@@ -119,11 +122,8 @@ pub struct Display {
 impl Display {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        spi0: Peri<'static, SPI0>,
-        sck: Peri<'static, PIN_18>,
-        mosi: Peri<'static, PIN_19>,
-        miso: Peri<'static, PIN_16>,
-        cs: Peri<'static, PIN_17>,
+        bus: &'static RefCell<Spi0Bus>,
+        cs: Output<'static>,
         dc: Peri<'static, PIN_13>,
         reset: Peri<'static, PIN_14>,
         backlight: Peri<'static, PIN_21>,
@@ -131,10 +131,7 @@ impl Display {
         system_config: SystemConfig,
     ) -> Self {
         let backend = backend::Backend::new(
-            spi0,
-            sck,
-            mosi,
-            miso,
+            bus,
             cs,
             dc,
             reset,

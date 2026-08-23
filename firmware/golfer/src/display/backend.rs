@@ -4,10 +4,7 @@ use defmt::info;
 
 use embassy_rp::{
     gpio::{Level, Output},
-    peripherals::{
-        PIN_13, PIN_14, PIN_16, PIN_17, PIN_18, PIN_19, PIN_21, SPI0,
-    },
-    spi::{Blocking, Config as SpiConfig, Spi},
+    peripherals::{PIN_13, PIN_14, PIN_21},
     Peri,
 };
 use embassy_time::Delay;
@@ -21,16 +18,20 @@ use mipidsi::{
 };
 use static_cell::StaticCell;
 
+use crate::spi0_bus::Spi0Bus;
+
 // -----------------------------------------------------------------------------
 // HARDWARE-SPECIFIC DISPLAY BACKEND
 //
-// This is the only file that should know:
+// This file knows:
 //
 //   * which physical TFT controller is attached
 //   * which driver crate is used
-//   * SPI frequency / bus construction
 //   * reset/backlight pins
 //   * module-specific orientation quirks
+//
+// SPI0 bus construction is intentionally NOT owned here anymore. The TFT now
+// shares SPI0 with the microSD card through embedded-hal-bus SpiDevice wrappers.
 //
 // When GOLFER moves from the prototype ILI9341 board to the final Newhaven
 // display, this is the file we expect to replace/rework.
@@ -39,15 +40,13 @@ use static_cell::StaticCell;
 pub const TFT_SPI_FREQUENCY_HZ: u32 = 24_000_000;
 const TFT_BUFFER_SIZE: usize = 512;
 
-type TftSpi = Spi<'static, SPI0, Blocking>;
 type TftSpiDevice =
-    RefCellDevice<'static, TftSpi, Output<'static>, Delay>;
+    RefCellDevice<'static, Spi0Bus, Output<'static>, Delay>;
 type TftInterface =
     SpiInterface<'static, TftSpiDevice, Output<'static>>;
 pub type DrawTargetImpl =
     mipidsi::Display<TftInterface, ILI9341Rgb565, Output<'static>>;
 
-static TFT_SPI_BUS: StaticCell<RefCell<TftSpi>> = StaticCell::new();
 static TFT_BUFFER: StaticCell<[u8; TFT_BUFFER_SIZE]> = StaticCell::new();
 
 pub struct Backend {
@@ -56,13 +55,9 @@ pub struct Backend {
 }
 
 impl Backend {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        spi0: Peri<'static, SPI0>,
-        sck: Peri<'static, PIN_18>,
-        mosi: Peri<'static, PIN_19>,
-        miso: Peri<'static, PIN_16>,
-        cs: Peri<'static, PIN_17>,
+        bus: &'static RefCell<Spi0Bus>,
+        cs: Output<'static>,
         dc: Peri<'static, PIN_13>,
         reset: Peri<'static, PIN_14>,
         backlight: Peri<'static, PIN_21>,
@@ -72,20 +67,6 @@ impl Backend {
             TFT_SPI_FREQUENCY_HZ
         );
 
-        let mut spi_config = SpiConfig::default();
-        spi_config.frequency = TFT_SPI_FREQUENCY_HZ;
-
-        let spi = Spi::new_blocking(
-            spi0,
-            sck,
-            mosi,
-            miso,
-            spi_config,
-        );
-
-        let bus = TFT_SPI_BUS.init(RefCell::new(spi));
-
-        let cs = Output::new(cs, Level::High);
         let dc = Output::new(dc, Level::Low);
         let reset = Output::new(reset, Level::High);
 

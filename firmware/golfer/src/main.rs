@@ -13,13 +13,16 @@ use panic_probe as _;
 mod display;
 mod gps;
 mod radio;
+mod spi0_bus;
+mod storage;
 mod system;
 
 use display::{Display, DisplayPage, GpsDisplayState, RadioDisplayState};
+use storage::PersistentLogLevel;
 
 // How long the startup system-information page remains visible.
 // This is intentionally generous for bring-up and will be shortened later.
-const BOOT_SCREEN_DURATION_SECS: u64 = 10;
+const BOOT_SCREEN_DURATION_SECS: u64 = 2;
 
 // The current nRF beacon increments its sequence once per second.
 const BEACON_SEQUENCE_RATE_HZ: u64 = 1;
@@ -31,9 +34,12 @@ const LINK_LOSS_TIMEOUT_SECS: u64 = 5;
 // applied only to the Embassy channel, never to the SX1262 receive future.
 const LINK_WATCHDOG_INTERVAL_MS: u64 = 250;
 
-// Extra slack when deciding whether a forward sequence jump is physically
-// plausible for a 1 Hz beacon. This protects the missed-packet counter from
-// corrupted sequence bytes near the edge of reception.
+// Sequence/time comparison is now DIAGNOSTIC ONLY.
+//
+// A suspicious forward jump is never permanently rejected. Instead, it becomes
+// an untrusted candidate. If the next packet is candidate + 1, the receiver
+// confirms the new baseline and resynchronizes. If the next packet returns to a
+// sane sequence, the candidate is discarded without poisoning sequence state.
 const SEQUENCE_GAP_TOLERANCE: u64 = 5;
 
 // If the transmitter reboots, its sequence starts near zero. A small backward
@@ -71,24 +77,67 @@ async fn main(spawner: Spawner) {
     info!("GOLFER firmware is online!");
 
     // -------------------------------------------------------------------------
-    // Display
+    // Shared SPI0 bus + storage
     //
-    // ILI9341 TFT on SPI0, native portrait orientation (240 x 320).
     // GP16 = MISO
-    // GP17 = TFT CS
     // GP18 = SCK
     // GP19 = MOSI
-    // GP13 = DC/RS
-    // GP14 = RESET
-    // GP21 = backlight enable (PWM later)
+    //
+    // GP17 = TFT CS
+    // GP22 = SD CS
+    //
+    // SPI0 begins at the SD-card initialization speed. Both chip-selects are
+    // driven HIGH before the card receives its startup clocks.
     // -------------------------------------------------------------------------
 
-    let mut display = Display::new(
+    let spi0_bus = spi0_bus::init(
         p.SPI0,
         p.PIN_18, // SCK
         p.PIN_19, // MOSI
         p.PIN_16, // MISO
-        p.PIN_17, // TFT CS
+    );
+
+    let tft_cs = Output::new(p.PIN_17, Level::High);
+    let sd_cs = Output::new(p.PIN_22, Level::High);
+
+    // Storage failure is intentionally non-fatal. If available, Storage keeps
+    // tonight's hardcoded receiver telemetry segment open for this entire boot.
+    let mut storage = storage::Storage::init(
+        spi0_bus,
+        sd_cs,
+    );
+
+    if let Some(storage) = storage.as_ref() {
+        info!(
+            "Receiver telemetry logging enabled: segment={}",
+            storage.segment_number()
+        );
+    } else {
+        warn!("Receiver telemetry logging unavailable");
+    }
+
+    // The card has completed its low-speed initialization attempt. SPI0 can now
+    // run at the normal TFT/runtime clock. The SD card shares this bus.
+    spi0_bus::set_frequency(
+        spi0_bus,
+        spi0_bus::RUN_FREQUENCY_HZ,
+    );
+
+    // -------------------------------------------------------------------------
+    // Display
+    //
+    // ILI9341 TFT on the shared SPI0 bus, native portrait orientation
+    // (240 x 320).
+    //
+    // GP17 = TFT CS
+    // GP13 = DC/RS
+    // GP14 = RESET
+    // GP21 = backlight enable (physically bypassed on current prototype)
+    // -------------------------------------------------------------------------
+
+    let mut display = Display::new(
+        spi0_bus,
+        tft_cs,
         p.PIN_13, // TFT DC/RS
         p.PIN_14, // TFT RESET
         p.PIN_21, // TFT backlight
@@ -163,7 +212,22 @@ async fn main(spawner: Spawner) {
     // Receiver state
     // -------------------------------------------------------------------------
 
+    // Retain the newest GPS state so every accepted radio packet can snapshot
+    // local position into its telemetry record.
+    let mut latest_gps_state = gps::GpsState::offline();
+
     let mut last_sequence: Option<u32> = None;
+
+    // Time associated with last_sequence specifically. This must remain
+    // separate from last_valid_rx_time because a suspicious-but-received packet
+    // should keep the link alive without immediately becoming sequence truth.
+    let mut last_sequence_rx_time: Option<Instant> = None;
+
+    // A wild forward jump gets one packet of probation rather than being
+    // rejected forever. candidate + 1 on the next packet confirms resync.
+    let mut pending_sequence_candidate: Option<u32> = None;
+
+    // Any structurally-valid packet keeps the RF link alive.
     let mut last_valid_rx_time: Option<Instant> = None;
 
     let mut received_packets: u32 = 0;
@@ -188,6 +252,8 @@ async fn main(spawner: Spawner) {
         // ---------------------------------------------------------------------
 
         if let Some(gps_state) = gps::GPS_STATE_SIGNAL.try_take() {
+            latest_gps_state = gps_state;
+
             display.update_gps(GpsDisplayState {
                 online: gps_state.online,
                 fix: gps_state.fix,
@@ -222,72 +288,245 @@ async fn main(spawner: Spawner) {
                 // -------------------------------------------------------------
                 // Sequence validation / packet-loss accounting
                 //
-                // We deliberately validate the sequence BEFORE updating counters
-                // or last_sequence. This prevents one corrupted sequence field
-                // from poisoning the rest of the test.
+                // IMPORTANT:
+                //
+                // Time-vs-sequence plausibility is no longer an acceptance gate.
+                // A large mismatch gets one packet of probation so a corrupted
+                // sequence cannot poison state, but legitimate long-outage
+                // reacquisition can confirm itself with the very next packet.
                 // -------------------------------------------------------------
 
+                let mut trust_sequence_now = true;
+                let mut sequence_already_confirmed = false;
+
                 if let Some(last) = last_sequence {
-                    if sequence == last {
-                        warn!("Ignoring duplicate packet: seq={}", sequence);
+                    // Repeated suspicious candidate: do not let it become a new
+                    // baseline merely because it arrived twice identically.
+                    if pending_sequence_candidate == Some(sequence) {
+                        warn!(
+                            "Ignoring duplicate suspicious sequence candidate: seq={}",
+                            sequence
+                        );
+
+                        if let Some(storage) = storage.as_mut() {
+                            storage.diag(
+                                PersistentLogLevel::Warn,
+                                now.as_millis(),
+                                format_args!(
+                                    "SEQ_CANDIDATE_DUPLICATE seq={} rssi={} snr={}",
+                                    sequence,
+                                    packet_status.rssi,
+                                    packet_status.snr
+                                ),
+                            );
+                        }
+
                         continue;
                     }
 
-                    if sequence > last {
-                        let sequence_gap = sequence - last;
+                    // If last packet was a suspicious jump and this packet is
+                    // exactly its successor, we have strong evidence that the
+                    // jump was real. Resynchronize immediately.
+                    if let Some(candidate) = pending_sequence_candidate {
+                        if candidate.checked_add(1) == Some(sequence)
+                            && candidate > last
+                        {
+                            let newly_missed =
+                                candidate.saturating_sub(last).saturating_sub(1);
 
-                        // The beacon increments once per second, so compare the
-                        // observed jump against the actual time since the last
-                        // valid packet, plus a little tolerance.
-                        let elapsed_secs = last_valid_rx_time
-                            .map(|last_time| now.duration_since(last_time).as_secs())
-                            .unwrap_or(0);
-
-                        let max_plausible_gap = elapsed_secs
-                            .saturating_mul(BEACON_SEQUENCE_RATE_HZ)
-                            .saturating_add(SEQUENCE_GAP_TOLERANCE)
-                            .max(1);
-
-                        if u64::from(sequence_gap) > max_plausible_gap {
-                            warn!(
-                                "Ignoring implausible sequence jump: last={} current={} gap={} max_plausible={}",
-                                last, sequence, sequence_gap, max_plausible_gap
-                            );
-                            continue;
-                        }
-
-                        let newly_missed = sequence_gap - 1;
-
-                        if newly_missed > 0 {
-                            missed_packets = missed_packets.saturating_add(newly_missed);
+                            if newly_missed > 0 {
+                                missed_packets =
+                                    missed_packets.saturating_add(newly_missed);
+                            }
 
                             warn!(
-                                "PACKET LOSS: missed {} packet(s) between seq={} and seq={}",
-                                newly_missed, last, sequence
+                                "Sequence resync confirmed: last={} candidate={} current={} missed={}",
+                                last,
+                                candidate,
+                                sequence,
+                                newly_missed
                             );
-                        }
-                    } else {
-                        // A real transmitter reboot should restart the sequence
-                        // close to zero. Accept that small reset; reject other
-                        // backward jumps as out-of-order/corrupted data.
-                        if sequence <= REBOOT_SEQUENCE_WINDOW {
-                            warn!(
-                                "Beacon sequence reset detected: last={} current={}",
-                                last, sequence
-                            );
+
+                            if let Some(storage) = storage.as_mut() {
+                                storage.diag(
+                                    PersistentLogLevel::Info,
+                                    now.as_millis(),
+                                    format_args!(
+                                        "SEQ_RESYNC_CONFIRMED prev={} candidate={} current={} missed={}",
+                                        last,
+                                        candidate,
+                                        sequence,
+                                        newly_missed
+                                    ),
+                                );
+                            }
+
+                            pending_sequence_candidate = None;
+                            sequence_already_confirmed = true;
                         } else {
-                            warn!(
-                                "Ignoring backward/out-of-order sequence: last={} current={}",
-                                last, sequence
-                            );
+                            // Candidate failed confirmation. Do not poison the
+                            // trusted baseline; evaluate this packet normally
+                            // against the last trusted sequence.
+                            if let Some(storage) = storage.as_mut() {
+                                storage.diag(
+                                    PersistentLogLevel::Debug,
+                                    now.as_millis(),
+                                    format_args!(
+                                        "SEQ_CANDIDATE_NOT_CONFIRMED candidate={} next={} trusted_prev={}",
+                                        candidate,
+                                        sequence,
+                                        last
+                                    ),
+                                );
+                            }
+
+                            pending_sequence_candidate = None;
+                        }
+                    }
+
+                    if !sequence_already_confirmed {
+                        if sequence == last {
+                            warn!("Ignoring duplicate packet: seq={}", sequence);
                             continue;
+                        }
+
+                        if sequence > last {
+                            let sequence_gap = sequence - last;
+
+                            let elapsed_ms = last_sequence_rx_time
+                                .map(|last_time| {
+                                    now.duration_since(last_time).as_millis()
+                                })
+                                .unwrap_or(0);
+
+                            let expected_gap = elapsed_ms
+                                .saturating_mul(BEACON_SEQUENCE_RATE_HZ)
+                                / 1_000;
+
+                            let max_plausible_gap = expected_gap
+                                .saturating_add(SEQUENCE_GAP_TOLERANCE)
+                                .max(1);
+
+                            if u64::from(sequence_gap) > max_plausible_gap {
+                                // Do NOT reject the RF packet and do NOT move the
+                                // trusted sequence baseline. Put the sequence on
+                                // one-packet probation instead.
+                                warn!(
+                                    "Suspicious sequence candidate: last={} current={} gap={} elapsed_ms={} expected_gap={} max_gap={}",
+                                    last,
+                                    sequence,
+                                    sequence_gap,
+                                    elapsed_ms,
+                                    expected_gap,
+                                    max_plausible_gap
+                                );
+
+                                if let Some(storage) = storage.as_mut() {
+                                    storage.diag(
+                                        PersistentLogLevel::Warn,
+                                        now.as_millis(),
+                                        format_args!(
+                                            "SEQ_SUSPICIOUS prev={} current={} gap={} elapsed_ms={} expected={} max={} rssi={} snr={} raw={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                                            last,
+                                            sequence,
+                                            sequence_gap,
+                                            elapsed_ms,
+                                            expected_gap,
+                                            max_plausible_gap,
+                                            packet_status.rssi,
+                                            packet_status.snr,
+                                            packet.data[0],
+                                            packet.data[1],
+                                            packet.data[2],
+                                            packet.data[3],
+                                            packet.data[4],
+                                            packet.data[5],
+                                            packet.data[6],
+                                            packet.data[7],
+                                            packet.data[8],
+                                            packet.data[9],
+                                        ),
+                                    );
+                                }
+
+                                pending_sequence_candidate = Some(sequence);
+                                trust_sequence_now = false;
+                            } else {
+                                let newly_missed = sequence_gap - 1;
+
+                                if newly_missed > 0 {
+                                    missed_packets =
+                                        missed_packets.saturating_add(newly_missed);
+
+                                    warn!(
+                                        "PACKET LOSS: missed {} packet(s) between seq={} and seq={}",
+                                        newly_missed,
+                                        last,
+                                        sequence
+                                    );
+                                }
+                            }
+                        } else {
+                            // A real transmitter reboot should restart the
+                            // sequence close to zero. Other backwards packets are
+                            // ignored, but this cannot create a sticky lockout.
+                            if sequence <= REBOOT_SEQUENCE_WINDOW {
+                                warn!(
+                                    "Beacon sequence reset detected: last={} current={}",
+                                    last,
+                                    sequence
+                                );
+
+                                if let Some(storage) = storage.as_mut() {
+                                    storage.diag(
+                                        PersistentLogLevel::Info,
+                                        now.as_millis(),
+                                        format_args!(
+                                            "SEQ_RESET prev={} current={}",
+                                            last,
+                                            sequence
+                                        ),
+                                    );
+                                }
+
+                                pending_sequence_candidate = None;
+                            } else {
+                                warn!(
+                                    "Ignoring backward/out-of-order sequence: last={} current={}",
+                                    last,
+                                    sequence
+                                );
+
+                                if let Some(storage) = storage.as_mut() {
+                                    storage.diag(
+                                        PersistentLogLevel::Warn,
+                                        now.as_millis(),
+                                        format_args!(
+                                            "SEQ_BACKWARD prev={} current={} rssi={} snr={}",
+                                            last,
+                                            sequence,
+                                            packet_status.rssi,
+                                            packet_status.snr
+                                        ),
+                                    );
+                                }
+
+                                continue;
+                            }
                         }
                     }
                 }
 
-                // Packet is now considered valid and accepted.
+                // The RF packet itself is accepted. A suspicious sequence can
+                // keep the link alive and be logged without immediately becoming
+                // the trusted sequence baseline.
                 received_packets = received_packets.saturating_add(1);
-                last_sequence = Some(sequence);
+
+                if trust_sequence_now {
+                    last_sequence = Some(sequence);
+                    last_sequence_rx_time = Some(now);
+                }
+
                 last_valid_rx_time = Some(now);
                 last_rssi = Some(packet_status.rssi);
                 last_snr = Some(packet_status.snr);
@@ -301,6 +540,55 @@ async fn main(spawner: Spawner) {
                     received_packets,
                     missed_packets
                 );
+
+                // -------------------------------------------------------------
+                // TEMPORARY RECEIVER TELEMETRY LOGGING TEST
+                //
+                // One synchronous FAT append for every accepted LoRa packet.
+                // The file remains open between packets. We deliberately do NOT
+                // flush each record; tonight we care about raw append latency
+                // and whether it interferes with continuous reception.
+                // -------------------------------------------------------------
+
+                if let Some(storage) = storage.as_mut() {
+                    let write_result = storage.log_receiver_packet(
+                        now.as_millis(),
+                        sequence,
+                        packet_status.rssi,
+                        packet_status.snr,
+                        received_packets,
+                        missed_packets,
+                        latest_gps_state,
+                    );
+
+                    match write_result {
+                        Some(stats) => {
+                            if let Some(checkpoint_us) = stats.checkpoint_us {
+                                info!(
+                                    "Telemetry append + checkpoint: {} us (append={} us checkpoint={} us) | GPS online={} fix={} sats={:?}",
+                                    stats.total_us,
+                                    stats.append_us,
+                                    checkpoint_us,
+                                    latest_gps_state.online,
+                                    latest_gps_state.fix,
+                                    latest_gps_state.satellites
+                                );
+                            } else {
+                                info!(
+                                    "Telemetry append: {} us | GPS online={} fix={} sats={:?}",
+                                    stats.append_us,
+                                    latest_gps_state.online,
+                                    latest_gps_state.fix,
+                                    latest_gps_state.satellites
+                                );
+                            }
+                        }
+
+                        None => {
+                            warn!("Telemetry write FAILED");
+                        }
+                    }
+                }
 
                 // -------------------------------------------------------------
                 // Update display state.
