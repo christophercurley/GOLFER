@@ -17,12 +17,14 @@ mod spi0_bus;
 mod storage;
 mod system;
 
-use display::{Display, DisplayPage, GpsDisplayState, RadioDisplayState};
+use display::{
+    Display, DisplayPage, GpsDisplayState, InitStatus, InitSubsystem, RadioDisplayState,
+};
 use storage::PersistentLogLevel;
 
-// How long the startup system-information page remains visible.
-// This is intentionally generous for bring-up and will be shortened later.
-const BOOT_SCREEN_DURATION_SECS: u64 = 2;
+// Once subsystem initialization has completed, leave the final boot status
+// visible briefly so the user can actually read the result.
+const BOOT_FINAL_STATUS_HOLD_MS: u64 = 1_000;
 
 // The current nRF beacon increments its sequence once per second.
 const BEACON_SEQUENCE_RATE_HZ: u64 = 1;
@@ -77,63 +79,24 @@ async fn main(spawner: Spawner) {
     info!("GOLFER firmware is online!");
 
     // -------------------------------------------------------------------------
-    // Shared SPI0 bus + storage
+    // Shared SPI0 bus + immediate display initialization
     //
-    // GP16 = MISO
-    // GP18 = SCK
-    // GP19 = MOSI
-    //
-    // GP17 = TFT CS
-    // GP22 = SD CS
-    //
-    // SPI0 begins at the SD-card initialization speed. Both chip-selects are
-    // driven HIGH before the card receives its startup clocks.
+    // The user-facing display comes alive BEFORE optional/slow subsystem
+    // initialization. This prevents SD-card behavior from producing a blank
+    // startup experience.
     // -------------------------------------------------------------------------
 
     let spi0_bus = spi0_bus::init(
-        p.SPI0,
-        p.PIN_18, // SCK
+        p.SPI0, p.PIN_18, // SCK
         p.PIN_19, // MOSI
         p.PIN_16, // MISO
     );
 
     let tft_cs = Output::new(p.PIN_17, Level::High);
-    let sd_cs = Output::new(p.PIN_22, Level::High);
+    let mut sd_cs = Output::new(p.PIN_22, Level::High);
 
-    // Storage failure is intentionally non-fatal. If available, Storage keeps
-    // tonight's hardcoded receiver telemetry segment open for this entire boot.
-    let mut storage = storage::Storage::init(
-        spi0_bus,
-        sd_cs,
-    );
-
-    if let Some(storage) = storage.as_ref() {
-        info!(
-            "Receiver telemetry logging enabled: segment={}",
-            storage.segment_number()
-        );
-    } else {
-        warn!("Receiver telemetry logging unavailable");
-    }
-
-    // The card has completed its low-speed initialization attempt. SPI0 can now
-    // run at the normal TFT/runtime clock. The SD card shares this bus.
-    spi0_bus::set_frequency(
-        spi0_bus,
-        spi0_bus::RUN_FREQUENCY_HZ,
-    );
-
-    // -------------------------------------------------------------------------
-    // Display
-    //
-    // ILI9341 TFT on the shared SPI0 bus, native portrait orientation
-    // (240 x 320).
-    //
-    // GP17 = TFT CS
-    // GP13 = DC/RS
-    // GP14 = RESET
-    // GP21 = backlight enable (physically bypassed on current prototype)
-    // -------------------------------------------------------------------------
+    // Bring the TFT up at its normal runtime rate immediately.
+    spi0_bus::set_frequency(spi0_bus, spi0_bus::RUN_FREQUENCY_HZ);
 
     let mut display = Display::new(
         spi0_bus,
@@ -145,15 +108,71 @@ async fn main(spawner: Spawner) {
         system.config().clone(),
     );
 
-    info!(
-        "Boot screen active for {} seconds",
-        BOOT_SCREEN_DURATION_SECS
-    );
+    info!("Boot initialization screen online");
 
-    Timer::after_secs(BOOT_SCREEN_DURATION_SECS).await;
+    // -------------------------------------------------------------------------
+    // SD card / storage
+    //
+    // Visible state starts yellow ("initializing..."). We temporarily lower the
+    // shared SPI bus to SD initialization speed, perform a cheap bounded CMD0
+    // presence probe, and only invoke the full FAT stack if a card responds.
+    //
+    // Missing/bad storage is non-fatal: mark NOK and continue boot.
+    // -------------------------------------------------------------------------
 
-    display.set_page(DisplayPage::General);
-    info!("Boot screen complete; entering general display");
+    display.set_init_status(InitSubsystem::SdCard, InitStatus::Initializing);
+
+    spi0_bus::set_frequency(spi0_bus, spi0_bus::SD_INIT_FREQUENCY_HZ);
+
+    let mut storage = if storage::card_present(spi0_bus, &mut sd_cs) {
+        storage::Storage::init(spi0_bus, sd_cs)
+    } else {
+        None
+    };
+
+    // Return SPI0 to normal runtime speed before touching the TFT again.
+    spi0_bus::set_frequency(spi0_bus, spi0_bus::RUN_FREQUENCY_HZ);
+
+    if let Some(storage_ref) = storage.as_mut() {
+        display.set_init_status(InitSubsystem::SdCard, InitStatus::Ok);
+
+        // DEBUG.LOG only becomes available once SD/FAT initialization has
+        // succeeded, so record the already-completed early boot stages now.
+        let boot_ms = Instant::now().as_millis();
+
+        storage_ref.diag(
+            PersistentLogLevel::Info,
+            boot_ms,
+            "BOOT",
+            "SYSTEM_INIT",
+            format_args!("result=OK"),
+        );
+
+        storage_ref.diag(
+            PersistentLogLevel::Info,
+            boot_ms,
+            "BOOT",
+            "DISPLAY_INIT",
+            format_args!("result=OK"),
+        );
+
+        storage_ref.diag(
+            PersistentLogLevel::Info,
+            boot_ms,
+            "BOOT",
+            "SD_CARD_INIT",
+            format_args!("result=OK"),
+        );
+
+        info!(
+            "Receiver telemetry logging enabled: segment={}",
+            storage_ref.segment_number()
+        );
+    } else {
+        display.set_init_status(InitSubsystem::SdCard, InitStatus::Nok);
+
+        warn!("Storage unavailable; GOLFER continuing without SD logging");
+    }
 
     // -------------------------------------------------------------------------
     // GPS
@@ -163,12 +182,27 @@ async fn main(spawner: Spawner) {
     // Embassy Signal. GP0 remains reserved for Pico -> GPS TX later.
     // -------------------------------------------------------------------------
 
+    display.set_init_status(InitSubsystem::Gps, InitStatus::Initializing);
+
     spawner.spawn(
         gps::receive_task(
             p.UART0, p.PIN_1, // GPS TX -> Pico UART0 RX
         )
         .expect("failed to create GPS receive task"),
     );
+
+    // "OK" here means the GPS UART/task is online. It does NOT mean GPS fix.
+    display.set_init_status(InitSubsystem::Gps, InitStatus::Ok);
+
+    if let Some(storage_ref) = storage.as_mut() {
+        storage_ref.diag(
+            PersistentLogLevel::Info,
+            Instant::now().as_millis(),
+            "BOOT",
+            "GPS_INIT",
+            format_args!("result=OK"),
+        );
+    }
 
     // -------------------------------------------------------------------------
     // LoRa radio
@@ -177,6 +211,8 @@ async fn main(spawner: Spawner) {
     // in radio.rs. main.rs only supplies the peripherals and owns application
     // behavior around received packets.
     // -------------------------------------------------------------------------
+
+    display.set_init_status(InitSubsystem::Lora, InitStatus::Initializing);
 
     let radio = match radio::Radio::new(
         p.SPI1, p.PIN_10, // SCK
@@ -189,9 +225,35 @@ async fn main(spawner: Spawner) {
     )
     .await
     {
-        Ok(radio) => radio,
+        Ok(radio) => {
+            display.set_init_status(InitSubsystem::Lora, InitStatus::Ok);
+
+            if let Some(storage_ref) = storage.as_mut() {
+                storage_ref.diag(
+                    PersistentLogLevel::Info,
+                    Instant::now().as_millis(),
+                    "BOOT",
+                    "LORA_INIT",
+                    format_args!("result=OK"),
+                );
+            }
+
+            radio
+        }
 
         Err(err) => {
+            display.set_init_status(InitSubsystem::Lora, InitStatus::Nok);
+
+            if let Some(storage_ref) = storage.as_mut() {
+                storage_ref.diag(
+                    PersistentLogLevel::Error,
+                    Instant::now().as_millis(),
+                    "BOOT",
+                    "LORA_INIT",
+                    format_args!("result=NOK error={:?}", err),
+                );
+            }
+
             error!("Radio initialization aborted: {}", err);
 
             loop {
@@ -203,6 +265,26 @@ async fn main(spawner: Spawner) {
             }
         }
     };
+
+    if let Some(storage_ref) = storage.as_mut() {
+        storage_ref.diag(
+            PersistentLogLevel::Info,
+            Instant::now().as_millis(),
+            "BOOT",
+            "INIT_COMPLETE",
+            format_args!("result=OK"),
+        );
+    }
+
+    info!(
+        "Initialization complete; holding final status for {} ms",
+        BOOT_FINAL_STATUS_HOLD_MS
+    );
+
+    Timer::after_millis(BOOT_FINAL_STATUS_HOLD_MS).await;
+
+    display.set_page(DisplayPage::General);
+    info!("Boot initialization complete; entering general display");
 
     // The SX1262 receive future now lives permanently inside its own task.
     // The application only waits on RX_CHANNEL, which is safe to timeout.
@@ -316,9 +398,7 @@ async fn main(spawner: Spawner) {
                                 "SEQ_CANDIDATE_DUPLICATE",
                                 format_args!(
                                     "seq={} rssi={} snr={}",
-                                    sequence,
-                                    packet_status.rssi,
-                                    packet_status.snr
+                                    sequence, packet_status.rssi, packet_status.snr
                                 ),
                             );
                         }
@@ -330,23 +410,16 @@ async fn main(spawner: Spawner) {
                     // exactly its successor, we have strong evidence that the
                     // jump was real. Resynchronize immediately.
                     if let Some(candidate) = pending_sequence_candidate {
-                        if candidate.checked_add(1) == Some(sequence)
-                            && candidate > last
-                        {
-                            let newly_missed =
-                                candidate.saturating_sub(last).saturating_sub(1);
+                        if candidate.checked_add(1) == Some(sequence) && candidate > last {
+                            let newly_missed = candidate.saturating_sub(last).saturating_sub(1);
 
                             if newly_missed > 0 {
-                                missed_packets =
-                                    missed_packets.saturating_add(newly_missed);
+                                missed_packets = missed_packets.saturating_add(newly_missed);
                             }
 
                             warn!(
                                 "Sequence resync confirmed: last={} candidate={} current={} missed={}",
-                                last,
-                                candidate,
-                                sequence,
-                                newly_missed
+                                last, candidate, sequence, newly_missed
                             );
 
                             if let Some(storage) = storage.as_mut() {
@@ -357,10 +430,7 @@ async fn main(spawner: Spawner) {
                                     "SEQ_RESYNC_CONFIRMED",
                                     format_args!(
                                         "prev={} candidate={} current={} missed={}",
-                                        last,
-                                        candidate,
-                                        sequence,
-                                        newly_missed
+                                        last, candidate, sequence, newly_missed
                                     ),
                                 );
                             }
@@ -379,9 +449,7 @@ async fn main(spawner: Spawner) {
                                     "SEQ_CANDIDATE_NOT_CONFIRMED",
                                     format_args!(
                                         "candidate={} next={} trusted_prev={}",
-                                        candidate,
-                                        sequence,
-                                        last
+                                        candidate, sequence, last
                                     ),
                                 );
                             }
@@ -400,18 +468,14 @@ async fn main(spawner: Spawner) {
                             let sequence_gap = sequence - last;
 
                             let elapsed_ms = last_sequence_rx_time
-                                .map(|last_time| {
-                                    now.duration_since(last_time).as_millis()
-                                })
+                                .map(|last_time| now.duration_since(last_time).as_millis())
                                 .unwrap_or(0);
 
-                            let expected_gap = elapsed_ms
-                                .saturating_mul(BEACON_SEQUENCE_RATE_HZ)
-                                / 1_000;
+                            let expected_gap =
+                                elapsed_ms.saturating_mul(BEACON_SEQUENCE_RATE_HZ) / 1_000;
 
-                            let max_plausible_gap = expected_gap
-                                .saturating_add(SEQUENCE_GAP_TOLERANCE)
-                                .max(1);
+                            let max_plausible_gap =
+                                expected_gap.saturating_add(SEQUENCE_GAP_TOLERANCE).max(1);
 
                             if u64::from(sequence_gap) > max_plausible_gap {
                                 // Do NOT reject the RF packet and do NOT move the
@@ -463,14 +527,11 @@ async fn main(spawner: Spawner) {
                                 let newly_missed = sequence_gap - 1;
 
                                 if newly_missed > 0 {
-                                    missed_packets =
-                                        missed_packets.saturating_add(newly_missed);
+                                    missed_packets = missed_packets.saturating_add(newly_missed);
 
                                     warn!(
                                         "PACKET LOSS: missed {} packet(s) between seq={} and seq={}",
-                                        newly_missed,
-                                        last,
-                                        sequence
+                                        newly_missed, last, sequence
                                     );
                                 }
                             }
@@ -481,8 +542,7 @@ async fn main(spawner: Spawner) {
                             if sequence <= REBOOT_SEQUENCE_WINDOW {
                                 warn!(
                                     "Beacon sequence reset detected: last={} current={}",
-                                    last,
-                                    sequence
+                                    last, sequence
                                 );
 
                                 if let Some(storage) = storage.as_mut() {
@@ -491,11 +551,7 @@ async fn main(spawner: Spawner) {
                                         now.as_millis(),
                                         "RADIO",
                                         "SEQ_RESET",
-                                        format_args!(
-                                            "prev={} current={}",
-                                            last,
-                                            sequence
-                                        ),
+                                        format_args!("prev={} current={}", last, sequence),
                                     );
                                 }
 
@@ -503,8 +559,7 @@ async fn main(spawner: Spawner) {
                             } else {
                                 warn!(
                                     "Ignoring backward/out-of-order sequence: last={} current={}",
-                                    last,
-                                    sequence
+                                    last, sequence
                                 );
 
                                 if let Some(storage) = storage.as_mut() {
@@ -515,10 +570,7 @@ async fn main(spawner: Spawner) {
                                         "SEQ_BACKWARD",
                                         format_args!(
                                             "prev={} current={} rssi={} snr={}",
-                                            last,
-                                            sequence,
-                                            packet_status.rssi,
-                                            packet_status.snr
+                                            last, sequence, packet_status.rssi, packet_status.snr
                                         ),
                                     );
                                 }

@@ -1,4 +1,5 @@
 mod backend;
+mod boot_status;
 mod ui;
 
 use crate::system::{SystemConfig, SystemInfo};
@@ -19,6 +20,59 @@ pub use backend::TFT_SPI_FREQUENCY_HZ;
 pub enum DisplayPage {
     Boot,
     General,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InitStatus {
+    Initializing,
+    Ok,
+    Nok,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InitSubsystem {
+    System,
+    Display,
+    SdCard,
+    Gps,
+    Lora,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BootStatus {
+    system: InitStatus,
+    display: InitStatus,
+    sd_card: InitStatus,
+    gps: InitStatus,
+    lora: InitStatus,
+}
+
+impl BootStatus {
+    const fn starting() -> Self {
+        Self {
+            // By the time the TFT can render this screen, System and Display
+            // initialization have already succeeded.
+            system: InitStatus::Ok,
+            display: InitStatus::Ok,
+            sd_card: InitStatus::Initializing,
+            gps: InitStatus::Initializing,
+            lora: InitStatus::Initializing,
+        }
+    }
+
+    fn set(
+        &mut self,
+        subsystem: InitSubsystem,
+        status: InitStatus,
+    ) {
+        match subsystem {
+            InitSubsystem::System => self.system = status,
+            InitSubsystem::Display => self.display = status,
+            InitSubsystem::SdCard => self.sd_card = status,
+            InitSubsystem::Gps => self.gps = status,
+            InitSubsystem::Lora => self.lora = status,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +171,7 @@ pub struct Display {
     system_config: SystemConfig,
     radio: RadioDisplayState,
     gps: GpsDisplayState,
+    boot_status: BootStatus,
 }
 
 impl Display {
@@ -145,6 +200,7 @@ impl Display {
             system_config,
             radio: RadioDisplayState::waiting(),
             gps: GpsDisplayState::offline(),
+            boot_status: BootStatus::starting(),
         };
 
         display.redraw_page();
@@ -162,6 +218,24 @@ impl Display {
 
         self.page = page;
         self.redraw_page();
+    }
+
+    pub fn set_init_status(
+        &mut self,
+        subsystem: InitSubsystem,
+        status: InitStatus,
+    ) {
+        self.boot_status.set(subsystem, status);
+
+        if self.page != DisplayPage::Boot {
+            return;
+        }
+
+        boot_status::update_row(
+            self.backend.target(),
+            subsystem,
+            status,
+        );
     }
 
     pub fn update_radio(&mut self, state: RadioDisplayState) {
@@ -231,8 +305,7 @@ impl Display {
 
         match self.page {
             DisplayPage::Boot => {
-                ui::clear_screen(target);
-                ui::draw_boot(target, &self.system_info, &self.system_config);
+                boot_status::draw(target, &self.boot_status);
             }
 
             DisplayPage::General => {

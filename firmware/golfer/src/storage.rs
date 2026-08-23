@@ -31,6 +31,16 @@ use crate::{
 const SYSTEM_LOG_FILENAME: &str = "SYS_LOG.TXT";
 const DEBUG_LOG_FILENAME: &str = "DEBUG.LOG";
 
+const SD_CMD0: [u8; 6] = [
+    0x40, // CMD0 / GO_IDLE_STATE
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x95, // valid CMD0 CRC
+];
+const SD_PRESENCE_ATTEMPTS: usize = 8;
+
 // -----------------------------------------------------------------------------
 // PERSISTENT DIAGNOSTIC LOGGING
 //
@@ -174,6 +184,89 @@ impl TimeSource for PlaceholderTimeSource {
             seconds: 0,
         }
     }
+}
+
+
+/// Fast, bounded SD presence probe.
+///
+/// This is deliberately performed before invoking embedded-sdmmc's full card
+/// initialization. A missing card should be recognized in milliseconds rather
+/// than allowing the filesystem stack to dominate GOLFER boot.
+///
+/// Success means CMD0 returned R1=0x01 (SPI idle state). It does NOT mean the
+/// filesystem is valid.
+pub fn card_present(
+    bus: &'static RefCell<Spi0Bus>,
+    sd_cs: &mut Output<'static>,
+) -> bool {
+    info!("Probing for SD card");
+
+    sd_cs.set_high();
+
+    // SD SPI-mode entry requires >=74 clocks with CS high. 10 bytes = 80 clocks.
+    if !spi0_bus::send_sd_startup_clocks(bus) {
+        warn!("SD presence probe: startup clocks failed");
+        return false;
+    }
+
+    for attempt in 1..=SD_PRESENCE_ATTEMPTS {
+        sd_cs.set_low();
+
+        let write_result = {
+            let mut spi = bus.borrow_mut();
+
+            if spi.blocking_write(&[0xFF]).is_err() {
+                false
+            } else {
+                spi.blocking_write(&SD_CMD0).is_ok()
+            }
+        };
+
+        if !write_result {
+            sd_cs.set_high();
+            warn!("SD presence probe: SPI write failed");
+            return false;
+        }
+
+        let mut response = 0xFFu8;
+
+        for _ in 0..16 {
+            let mut byte = [0xFFu8];
+
+            let read_ok = bus
+                .borrow_mut()
+                .blocking_transfer_in_place(&mut byte)
+                .is_ok();
+
+            if !read_ok {
+                sd_cs.set_high();
+                warn!("SD presence probe: SPI read failed");
+                return false;
+            }
+
+            // R1 responses have bit 7 clear.
+            if byte[0] & 0x80 == 0 {
+                response = byte[0];
+                break;
+            }
+        }
+
+        sd_cs.set_high();
+
+        // Extra clocks after deselect.
+        let _ = bus.borrow_mut().blocking_write(&[0xFF]);
+
+        if response == 0x01 {
+            info!(
+                "SD card detected on presence probe attempt {}",
+                attempt
+            );
+            return true;
+        }
+    }
+
+    warn!("SD card not detected");
+    false
 }
 
 impl Storage {
