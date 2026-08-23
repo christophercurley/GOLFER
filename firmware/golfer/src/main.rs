@@ -10,6 +10,8 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 
 use panic_probe as _;
 
+mod audio;
+mod buttons;
 mod display;
 mod gps;
 mod radio;
@@ -61,6 +63,82 @@ fn decode_sequence(payload: &[u8]) -> Option<u32> {
     ]))
 }
 
+// -----------------------------------------------------------------------------
+// TEMPORARY BUTTON/AUDIO BRING-UP POLICY
+//
+// buttons.rs owns only the four physical inputs. audio.rs owns only PWM/audio.
+// This task is deliberately application-level glue for today's hardware test:
+// each held button requests a distinct continuous tone.
+//
+// If more than one button is held, the most recently pressed button wins. When
+// that button is released, another still-held button resumes automatically.
+// -----------------------------------------------------------------------------
+
+const BUTTON_TEST_DRIVE_PERCENT: u8 = 10;
+
+fn button_test_frequency_hz(button: buttons::Button) -> u32 {
+    match button {
+        buttons::Button::One => 330,
+        buttons::Button::Two => 440,
+        buttons::Button::Three => 550,
+        buttons::Button::Four => 660,
+    }
+}
+
+#[embassy_executor::task]
+async fn button_audio_test_task() {
+    let mut held = [false; 4];
+    let mut active: Option<buttons::Button> = None;
+
+    loop {
+        let event = buttons::EVENTS.receive().await;
+        let index = event.button.index();
+
+        if event.pressed {
+            held[index] = true;
+            active = Some(event.button);
+
+            audio::play_tone(
+                button_test_frequency_hz(event.button),
+                BUTTON_TEST_DRIVE_PERCENT,
+            )
+            .await;
+
+            continue;
+        }
+
+        held[index] = false;
+
+        // Releasing a non-active held button must not interrupt the tone of the
+        // button that currently owns the speaker.
+        if active != Some(event.button) {
+            continue;
+        }
+
+        // If another button remains held, resume one of those tones instead of
+        // going silent. Reverse order is only a deterministic tie-breaker; this
+        // temporary test policy will eventually be replaced by real UI input
+        // handling.
+        let fallback = buttons::Button::ALL
+            .iter()
+            .rev()
+            .copied()
+            .find(|button| held[button.index()]);
+
+        active = fallback;
+
+        if let Some(button) = fallback {
+            audio::play_tone(
+                button_test_frequency_hz(button),
+                BUTTON_TEST_DRIVE_PERCENT,
+            )
+            .await;
+        } else {
+            audio::stop().await;
+        }
+    }
+}
+
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
@@ -109,6 +187,26 @@ async fn main(spawner: Spawner) {
     );
 
     info!("Boot initialization screen online");
+
+    // -------------------------------------------------------------------------
+    // Audio
+    //
+    // Audio is intentionally not represented as an initialization-screen
+    // subsystem. The dedicated audio task owns PWM5 / GP26 and synthesized
+    // sound sequencing. Important UI sounds preempt routine button/sonification
+    // audio and the latest routine tone resumes afterward.
+    // -------------------------------------------------------------------------
+
+    spawner.spawn(
+        audio::task(
+            p.PWM_SLICE5,
+            p.PIN_26,
+        )
+        .expect("failed to create audio task"),
+    );
+
+    audio::play_ui_sound(audio::UiSound::Startup).await;
+    info!("Startup chime queued");
 
     // -------------------------------------------------------------------------
     // SD card / storage
@@ -256,6 +354,9 @@ async fn main(spawner: Spawner) {
 
             error!("Radio initialization aborted: {}", err);
 
+            // Ensure no routine tone remains requested if boot aborts here.
+            audio::stop().await;
+
             loop {
                 led.set_high();
                 Timer::after_millis(100).await;
@@ -282,6 +383,30 @@ async fn main(spawner: Spawner) {
     );
 
     Timer::after_millis(BOOT_FINAL_STATUS_HOLD_MS).await;
+
+    // -------------------------------------------------------------------------
+    // Buttons
+    //
+    // Buttons are intentionally not represented on the initialization screen.
+    // Their hardware task owns GP4-GP7 and publishes debounced active-low state
+    // changes. A temporary application task turns those events into four held
+    // test tones for this bring-up stage.
+    // -------------------------------------------------------------------------
+
+    spawner.spawn(
+        buttons::task(
+            p.PIN_4,
+            p.PIN_5,
+            p.PIN_6,
+            p.PIN_7,
+        )
+        .expect("failed to create button task"),
+    );
+
+    spawner.spawn(
+        button_audio_test_task()
+            .expect("failed to create button audio test task"),
+    );
 
     display.set_page(DisplayPage::General);
     info!("Boot initialization complete; entering general display");
@@ -591,6 +716,8 @@ async fn main(spawner: Spawner) {
                     last_sequence_rx_time = Some(now);
                 }
 
+                let link_was_lost = link_lost_displayed;
+
                 last_valid_rx_time = Some(now);
                 last_rssi = Some(packet_status.rssi);
                 last_snr = Some(packet_status.snr);
@@ -666,6 +793,11 @@ async fn main(spawner: Spawner) {
                     missed_packets,
                 ));
 
+                if link_was_lost {
+                    audio::play_ui_sound(audio::UiSound::LinkReacquired).await;
+                    info!("Link reacquisition sound queued");
+                }
+
                 // Brief visible indication of an accepted packet.
                 led.set_high();
                 Timer::after_millis(75).await;
@@ -706,6 +838,8 @@ async fn main(spawner: Spawner) {
                 ));
 
                 link_lost_displayed = true;
+                audio::play_ui_sound(audio::UiSound::LinkLost).await;
+                info!("Link-loss sound queued");
             }
         }
     }
