@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use defmt::{error, info, warn};
+use defmt::{debug, error, info, warn};
 use defmt_rtt as _;
 
 use embassy_executor::Spawner;
@@ -29,7 +29,7 @@ use storage::PersistentLogLevel;
 // visible briefly so the user can actually read the result.
 const BOOT_FINAL_STATUS_HOLD_MS: u64 = 1_000;
 
-// The current nRF beacon increments its sequence once per second.
+// The temporary native-packet nRF beacon increments its sequence once per second.
 const BEACON_SEQUENCE_RATE_HZ: u64 = 1;
 
 // If no packet arrives for this long, show LINK LOST on the OLED.
@@ -51,18 +51,19 @@ const SEQUENCE_GAP_TOLERANCE: u64 = 5;
 // jump into this window is treated as a beacon restart rather than corruption.
 const REBOOT_SEQUENCE_WINDOW: u32 = 10;
 
-// Current test-packet magic from the nRF beacon.
-const PACKET_MAGIC: &[u8; 4] = b"MRU1";
+// -----------------------------------------------------------------------------
+// TEMPORARY NATIVE-PACKET ACCEPTANCE CONTEXT
+//
+// Survey membership / peer authorization will eventually come from GOLFER's
+// persistent survey state. During this protocol bring-up, the temporary MRU
+// beacon transmits one fixed System ID and Survey ID. Keep this policy here in
+// the application layer rather than radio.rs: the radio subsystem should remain
+// capable of receiving arbitrary valid GOLFER traffic for future discovery,
+// joining, multi-GOLFER operation, and other packet classes.
+// -----------------------------------------------------------------------------
 
-fn decode_sequence(payload: &[u8]) -> Option<u32> {
-    if payload.len() < 10 || &payload[0..4] != PACKET_MAGIC {
-        return None;
-    }
-
-    Some(u32::from_le_bytes([
-        payload[6], payload[7], payload[8], payload[9],
-    ]))
-}
+const TEST_EXPECTED_SENDER_SYSTEM_ID: u64 = 0x4D52_5500_0000_0001;
+const TEST_EXPECTED_SURVEY_ID: u32 = 0xA000_0001;
 
 // -----------------------------------------------------------------------------
 // TEMPORARY BUTTON/AUDIO BRING-UP POLICY
@@ -160,10 +161,10 @@ async fn main(spawner: Spawner) {
     // -------------------------------------------------------------------------
     // Native GOLFER RF packet codec
     //
-    // Commit A intentionally does NOT change live radio behavior. Run a small
-    // on-device golden-vector self-test so the 48-byte TelemetryV1 encoder,
-    // decoder, and application CRC32 are exercised on the RP2350 before we
-    // teach the legacy nRF beacon to transmit this format.
+    // Keep the same on-device golden-vector self-test used during packet-format
+    // bring-up. GOLFER now also uses this codec for live native TelemetryV1 RX,
+    // so a self-test failure is a prominent indication that packet handling must
+    // not be trusted.
     // -------------------------------------------------------------------------
 
     if packet::golden_self_test() {
@@ -453,11 +454,18 @@ async fn main(spawner: Spawner) {
     // rejected forever. candidate + 1 on the next packet confirms resync.
     let mut pending_sequence_candidate: Option<u32> = None;
 
-    // Any structurally-valid packet keeps the RF link alive.
+    // Only a fully decoded, application-CRC-valid native TelemetryV1 packet
+    // from the expected survey context keeps the RF link alive.
     let mut last_valid_rx_time: Option<Instant> = None;
 
+    // RX means accepted native survey telemetry, not merely an SX1262 RxDone.
+    // This is intentionally separate from application CRC failures and other
+    // malformed/foreign frames leaked upward by the current PHY stack.
     let mut received_packets: u32 = 0;
     let mut missed_packets: u32 = 0;
+    let mut crc_failures: u32 = 0;
+    let mut invalid_native_packets: u32 = 0;
+    let mut foreign_context_packets: u32 = 0;
 
     let mut last_rssi: Option<i16> = None;
     let mut last_snr: Option<i16> = None;
@@ -504,12 +512,158 @@ async fn main(spawner: Spawner) {
                 let len = received_len as usize;
                 let packet_status = packet.status;
 
-                let Some(sequence) = decode_sequence(&packet.data[..len]) else {
-                    warn!("Ignoring invalid/unknown packet: len={}", received_len);
-                    continue;
+                let now = Instant::now();
+
+                // -------------------------------------------------------------
+                // Native TelemetryV1 validation boundary
+                //
+                // Nothing below this point is allowed to affect GOLFER's valid
+                // RX count, link-alive timer, sequence state, telemetry log, or
+                // UI unless the application-level packet CRC and field decoder
+                // have both succeeded. This is deliberate defense-in-depth for
+                // the current lora-phy 3.0.1 behavior that can surface an
+                // SX1262 CRC-failed payload as a successful receive.
+                // -------------------------------------------------------------
+
+                let telemetry = match packet::TelemetryV1::decode(&packet.data[..len]) {
+                    Ok(telemetry) => telemetry,
+
+                    Err(packet::DecodeError::CrcMismatch) => {
+                        crc_failures = crc_failures.saturating_add(1);
+
+                        if let Some((stored_crc, computed_crc)) =
+                            packet::crc32_details(&packet.data[..len])
+                        {
+                            warn!(
+                                "Dropping TelemetryV1 CRC failure: count={} rssi={} snr={} stored_crc={} computed_crc={}",
+                                crc_failures,
+                                packet_status.rssi,
+                                packet_status.snr,
+                                stored_crc,
+                                computed_crc
+                            );
+
+                            if let Some(storage) = storage.as_mut() {
+                                storage.diag(
+                                    PersistentLogLevel::Debug,
+                                    now.as_millis(),
+                                    "RADIO",
+                                    "APP_CRC_FAILED",
+                                    format_args!(
+                                        "count={} rssi={} snr={} stored_crc={} computed_crc={}",
+                                        crc_failures,
+                                        packet_status.rssi,
+                                        packet_status.snr,
+                                        stored_crc,
+                                        computed_crc
+                                    ),
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "Dropping TelemetryV1 CRC failure: count={} rssi={} snr={}",
+                                crc_failures,
+                                packet_status.rssi,
+                                packet_status.snr
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    Err(err) => {
+                        invalid_native_packets =
+                            invalid_native_packets.saturating_add(1);
+
+                        warn!(
+                            "Ignoring invalid/unknown native packet: len={} error={} count={}",
+                            received_len,
+                            err.label(),
+                            invalid_native_packets
+                        );
+
+                        if let Some(storage) = storage.as_mut() {
+                            storage.diag(
+                                PersistentLogLevel::Debug,
+                                now.as_millis(),
+                                "RADIO",
+                                "NATIVE_PACKET_REJECTED",
+                                format_args!(
+                                    "len={} error={} count={} rssi={} snr={}",
+                                    received_len,
+                                    err.label(),
+                                    invalid_native_packets,
+                                    packet_status.rssi,
+                                    packet_status.snr
+                                ),
+                            );
+                        }
+
+                        continue;
+                    }
                 };
 
-                let now = Instant::now();
+                // Temporary survey/peer policy for the MRU acceptance beacon.
+                // A valid GOLFER packet from some other context is not corrupt;
+                // it simply does not belong to this active test survey. Future
+                // application routing can branch discovery/join/control packets
+                // elsewhere rather than discarding them here.
+                if telemetry.sender_system_id != TEST_EXPECTED_SENDER_SYSTEM_ID
+                    || telemetry.survey_id != TEST_EXPECTED_SURVEY_ID
+                {
+                    foreign_context_packets =
+                        foreign_context_packets.saturating_add(1);
+
+                    warn!(
+                        "Ignoring foreign TelemetryV1: sender={} survey={} seq={} count={}",
+                        telemetry.sender_system_id,
+                        telemetry.survey_id,
+                        telemetry.sequence,
+                        foreign_context_packets
+                    );
+
+                    if let Some(storage) = storage.as_mut() {
+                        storage.diag(
+                            PersistentLogLevel::Debug,
+                            now.as_millis(),
+                            "RADIO",
+                            "SURVEY_CONTEXT_REJECTED",
+                            format_args!(
+                                "sender={} survey={} seq={} mode={} count={}",
+                                telemetry.sender_system_id,
+                                telemetry.survey_id,
+                                telemetry.sequence,
+                                telemetry.sender_mode,
+                                foreign_context_packets
+                            ),
+                        );
+                    }
+
+                    continue;
+                }
+
+                let sequence = telemetry.sequence;
+
+                debug!(
+                    "RX TelemetryV1 fields: sender={} survey={} mode={} seq={} utc={:?} tx_lat={:?} tx_lon={:?} alt_half_m={:?} speed_cm_s={:?} course_cdeg={:?} fix={} sats={} hdop_tenths={:?} temp_centi_c={:?} pressure_10pa={:?} humidity_half_pct={:?} battery_soc={:?}",
+                    telemetry.sender_system_id,
+                    telemetry.survey_id,
+                    telemetry.sender_mode,
+                    telemetry.sequence,
+                    telemetry.gps_unix_time,
+                    telemetry.latitude_e7,
+                    telemetry.longitude_e7,
+                    telemetry.altitude_half_m,
+                    telemetry.speed_cm_s,
+                    telemetry.course_cdeg,
+                    telemetry.gps_fix_class as u8,
+                    telemetry.satellites,
+                    telemetry.hdop_tenths,
+                    telemetry.temperature_centi_c,
+                    telemetry.pressure_10pa,
+                    telemetry.humidity_half_percent,
+                    telemetry.battery_soc_percent
+                );
 
                 // -------------------------------------------------------------
                 // Sequence validation / packet-loss accounting
@@ -517,9 +671,11 @@ async fn main(spawner: Spawner) {
                 // IMPORTANT:
                 //
                 // Time-vs-sequence plausibility is no longer an acceptance gate.
-                // A large mismatch gets one packet of probation so a corrupted
-                // sequence cannot poison state, but legitimate long-outage
-                // reacquisition can confirm itself with the very next packet.
+                // Application CRC has already proven packet integrity here; the
+                // probation logic remains as defense-in-depth and prevents an
+                // unexpected sequence transition from poisoning bookkeeping while
+                // still allowing legitimate long-outage reacquisition to confirm
+                // itself with the very next packet.
                 // -------------------------------------------------------------
 
                 let mut trust_sequence_now = true;
@@ -642,25 +798,18 @@ async fn main(spawner: Spawner) {
                                         "RADIO",
                                         "SEQ_SUSPICIOUS",
                                         format_args!(
-                                            "prev={} current={} gap={} elapsed_ms={} expected={} max={} rssi={} snr={} raw={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                                            "prev={} current={} gap={} elapsed_ms={} expected={} max={} sender={} survey={} mode={} rssi={} snr={} app_crc=OK",
                                             last,
                                             sequence,
                                             sequence_gap,
                                             elapsed_ms,
                                             expected_gap,
                                             max_plausible_gap,
+                                            telemetry.sender_system_id,
+                                            telemetry.survey_id,
+                                            telemetry.sender_mode,
                                             packet_status.rssi,
                                             packet_status.snr,
-                                            packet.data[0],
-                                            packet.data[1],
-                                            packet.data[2],
-                                            packet.data[3],
-                                            packet.data[4],
-                                            packet.data[5],
-                                            packet.data[6],
-                                            packet.data[7],
-                                            packet.data[8],
-                                            packet.data[9],
                                         ),
                                     );
                                 }
@@ -725,9 +874,10 @@ async fn main(spawner: Spawner) {
                     }
                 }
 
-                // The RF packet itself is accepted. A suspicious sequence can
-                // keep the link alive and be logged without immediately becoming
-                // the trusted sequence baseline.
+                // The native packet itself is accepted. A suspicious but
+                // application-CRC-valid sequence can keep the link alive and be
+                // logged without immediately becoming the trusted sequence
+                // baseline. Invalid/CRC-failed/foreign packets never reach here.
                 received_packets = received_packets.saturating_add(1);
 
                 if trust_sequence_now {
@@ -743,12 +893,15 @@ async fn main(spawner: Spawner) {
                 link_lost_displayed = false;
 
                 info!(
-                    "RX seq={} RSSI={} dBm SNR={} dB | received={} missed={}",
+                    "RX TelemetryV1 seq={} sender={} survey={} RSSI={} dBm SNR={} dB | received={} missed={} app_crc_fail={}",
                     sequence,
+                    telemetry.sender_system_id,
+                    telemetry.survey_id,
                     packet_status.rssi,
                     packet_status.snr,
                     received_packets,
-                    missed_packets
+                    missed_packets,
+                    crc_failures
                 );
 
                 // -------------------------------------------------------------

@@ -146,6 +146,19 @@ pub enum DecodeError {
     InvalidField,
 }
 
+impl DecodeError {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WrongLength => "WRONG_LENGTH",
+            Self::BadMarker => "BAD_MARKER",
+            Self::UnsupportedVersion => "UNSUPPORTED_VERSION",
+            Self::UnsupportedPacketType => "UNSUPPORTED_PACKET_TYPE",
+            Self::CrcMismatch => "CRC_MISMATCH",
+            Self::InvalidField => "INVALID_FIELD",
+        }
+    }
+}
+
 impl TelemetryV1 {
     pub fn encode(&self) -> Result<[u8; TELEMETRY_V1_LEN], EncodeError> {
         self.validate()?;
@@ -338,6 +351,26 @@ impl TelemetryV1 {
 
         Ok(())
     }
+}
+
+/// Return the CRC stored in a TelemetryV1 frame and the CRC computed over its
+/// protected bytes. This is intentionally separate from `decode()` so the RX
+/// diagnostics can report both values when a native packet fails integrity.
+pub fn crc32_details(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() != TELEMETRY_V1_LEN {
+        return None;
+    }
+
+    let stored = u32::from_le_bytes([
+        bytes[TELEMETRY_V1_CRC_OFFSET],
+        bytes[TELEMETRY_V1_CRC_OFFSET + 1],
+        bytes[TELEMETRY_V1_CRC_OFFSET + 2],
+        bytes[TELEMETRY_V1_CRC_OFFSET + 3],
+    ]);
+
+    let computed = crc32_ieee(&bytes[..TELEMETRY_V1_CRC_OFFSET]);
+
+    Some((stored, computed))
 }
 
 /// Golden packet used to prove that independent implementations agree on the
