@@ -25,11 +25,21 @@ use heapless::String;
 
 use crate::{
     gps::GpsState,
+    packet::TelemetryV1,
     spi0_bus::{self, Spi0Bus},
+    system::SystemInfo,
 };
 
 const SYSTEM_LOG_FILENAME: &str = "SYS_LOG.TXT";
 const DEBUG_LOG_FILENAME: &str = "DEBUG.LOG";
+const RX_LOG_FILENAME: &str = "RX.LOG";
+const LOCAL_LOG_FILENAME: &str = "LOCAL.LOG";
+const EVENT_LOG_FILENAME: &str = "EVENT.LOG";
+const META_FILENAME: &str = "META.TXT";
+const BOOT_COUNTER_FILENAME: &str = "BOOT.NXT";
+
+/// Logging schema introduced by the per-survey/per-boot directory layout.
+pub const LOG_SCHEMA_VERSION: u16 = 3;
 
 const SD_CMD0: [u8; 6] = [
     0x40, // CMD0 / GO_IDLE_STATE
@@ -48,17 +58,9 @@ const SD_PRESENCE_ATTEMPTS: usize = 8;
 //
 //   <timestamp> <time_source> <uptime_ms> <level> <originator> <event_id> ...
 //
-// Current time placeholders:
-//
-//   timestamp   = NA
-//   time_source = UNKNOWN
-//
-// Example:
-//
-//   NA UNKNOWN 13761 DEBUG STORAGE FS_APPEND_CHECKPOINT us=6636 ...
-//
-// This shape is intentionally parser-friendly and leaves room for the future
-// GOLFER time package without sacrificing the always-available monotonic clock.
+// Before GPS UTC is available, the envelope begins with `NA UNKNOWN`. Once
+// RMC provides UTC, it becomes `<unix_ms> GPS <mono_ms> ...`. Monotonic
+// time remains authoritative and is always present.
 // -----------------------------------------------------------------------------
 
 /// Persistent DEBUG.LOG threshold.
@@ -124,9 +126,14 @@ pub struct TelemetryWriteStats {
 // -----------------------------------------------------------------------------
 
 const SURVEY_ROOT_DIR: &str = "SURVEY";
-const TEST_SURVEY_ID: &str = "A0000001";
-const RECEIVER_LOG_PREFIX: u8 = b'R';
-const RECEIVER_LOG_EXTENSION: &[u8] = b"LOG";
+
+/// Temporary active survey for current bring-up. Bumping this from A0000001
+/// creates a clean historical boundary between the legacy flat logs and
+/// Logging V2's per-boot/session directory layout.
+pub const TEST_SURVEY_ID: u32 = 0xA000_0003;
+
+const BOOT_SESSION_PREFIX: u8 = b'B';
+const MAX_BOOT_SESSION: u32 = 9_999_999;
 
 type SdSpiDevice =
     RefCellDevice<'static, Spi0Bus, Output<'static>, Delay>;
@@ -147,20 +154,52 @@ type VolumeManagerImpl =
 pub struct Storage {
     volume_manager: VolumeManagerImpl,
 
-    // Kept open for the lifetime of this boot/test segment.
-    survey_volume: RawVolume,
-    survey_dir: RawDirectory,
-    telemetry_file: RawFile,
+    // One FAT volume stays open for the lifetime of Storage. When a survey is
+    // active, `mode` owns the current Bxxxxxxx directory and RX.LOG. When no
+    // survey is active, `mode` instead owns the root directory used by the
+    // global DEBUG.LOG fallback.
+    storage_volume: RawVolume,
+    mode: StorageMode,
 
-    // DEBUG.LOG lives at the card root. Failure to create/open it does NOT take
-    // survey telemetry offline.
-    debug_root: Option<RawDirectory>,
+    // DEBUG.LOG is survey/session-local whenever a survey is active. It falls
+    // back to /DEBUG.LOG only when there is no active survey (or session setup
+    // fails). Diagnostic-log failure never takes the rest of storage offline.
     debug_file: Option<RawFile>,
     debug_buffer: String<DEBUG_BUFFER_CAPACITY>,
 
-    segment_number: u32,
-    records_written: u32,
+    local_records_written: u32,
+
+    // Once GPS UTC is known, this anchor lets every subsequent log product
+    // carry both monotonic boot time and an inferred UTC second. Analyzer can
+    // also use the explicit TIME_SYNC event to map earlier monotonic records.
+    utc_anchor: Option<UtcAnchor>,
 }
+
+#[derive(Clone, Copy)]
+enum StorageMode {
+    Survey {
+        session_dir: RawDirectory,
+        rx_file: RawFile,
+        local_file: RawFile,
+        event_file: RawFile,
+        survey_id: u32,
+        session_number: u32,
+    },
+    Global {
+        root_dir: RawDirectory,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct UtcAnchor {
+    mono_ms: u64,
+    unix_ms: u64,
+}
+
+const LOCAL_FLAG_SURVEY_ACTIVE: u32 = 1 << 0;
+const LOCAL_FLAG_GPS_ONLINE: u32 = 1 << 1;
+const LOCAL_FLAG_GPS_FIX: u32 = 1 << 2;
+const LOCAL_FLAG_LINK_UP: u32 = 1 << 3;
 
 /// Temporary FAT timestamp source.
 ///
@@ -270,29 +309,40 @@ pub fn card_present(
 }
 
 impl Storage {
-    /// Initialize SD storage and the current primitive survey segment.
+    /// Initialize SD storage.
     ///
-    /// Survey storage failure is non-fatal to GOLFER as a whole. DEBUG.LOG
-    /// failure is additionally non-fatal to survey logging.
+    /// When `active_survey_id` is Some, create a new per-boot/session directory:
+    ///
+    ///     /SURVEY/Axxxxxxx/Bxxxxxxx/
+    ///
+    /// containing RX.LOG, LOCAL.LOG, EVENT.LOG, DEBUG.LOG, and META.TXT.
+    ///
+    /// When no survey is active, diagnostics fall back to /DEBUG.LOG. The same
+    /// global fallback is used if survey-session setup fails, so a healthy card
+    /// can still capture why survey logging did not come online.
     pub fn init(
         bus: &'static RefCell<Spi0Bus>,
         sd_cs: Output<'static>,
+        system_info: SystemInfo,
+        active_survey_id: Option<u32>,
     ) -> Option<Self> {
+        let total_started = Instant::now();
         info!("Initializing GOLFER storage");
+
+        let card_init_started = Instant::now();
 
         if !spi0_bus::send_sd_startup_clocks(bus) {
             error!("SD startup clocks failed");
             return None;
         }
 
-        let spi_device =
-            match RefCellDevice::new(bus, sd_cs, Delay) {
-                Ok(device) => device,
-                Err(_) => {
-                    error!("Failed to create SD SPI device");
-                    return None;
-                }
-            };
+        let spi_device = match RefCellDevice::new(bus, sd_cs, Delay) {
+            Ok(device) => device,
+            Err(_) => {
+                error!("Failed to create SD SPI device");
+                return None;
+            }
+        };
 
         let sdcard = SdCard::new(spi_device, Delay);
 
@@ -304,66 +354,143 @@ impl Storage {
             }
         };
 
+        let card_init_us = Instant::now()
+            .duration_since(card_init_started)
+            .as_micros();
+
         info!("SD card initialized: {} bytes", card_size);
 
-        let volume_manager =
-            VolumeManager::new(sdcard, PlaceholderTimeSource);
+        // SD cards require the low SPI clock only during SPI-mode/card
+        // initialization. Once num_bytes() succeeds the card is initialized,
+        // so immediately promote the shared bus to normal runtime speed before
+        // doing any FAT/directory/file work. V2A originally left the entire
+        // filesystem setup at 400 kHz, which made boot take several seconds.
+        spi0_bus::set_frequency(bus, spi0_bus::RUN_FREQUENCY_HZ);
+        info!(
+            "SD card promoted to runtime SPI frequency: {} Hz",
+            spi0_bus::RUN_FREQUENCY_HZ
+        );
 
+        let volume_manager = VolumeManager::new(sdcard, PlaceholderTimeSource);
+
+        let syslog_started = Instant::now();
         if !initialize_system_log(&volume_manager) {
             warn!("SD card online, but system log initialization failed");
         }
+        let syslog_us = Instant::now()
+            .duration_since(syslog_started)
+            .as_micros();
 
-        let (
-            survey_volume,
-            survey_dir,
-            telemetry_file,
-            segment_number,
-        ) = match initialize_test_survey_log(&volume_manager) {
-            Some(handles) => handles,
-            None => {
-                error!("Telemetry survey-log initialization failed");
+        let mount_started = Instant::now();
+        let storage_volume = match volume_manager.open_raw_volume(VolumeIdx(0)) {
+            Ok(volume) => volume,
+            Err(_) => {
+                error!("Failed to mount FAT volume for GOLFER storage");
                 return None;
             }
         };
+        let mount_us = Instant::now()
+            .duration_since(mount_started)
+            .as_micros();
 
-        // DEBUG.LOG is deliberately optional. A diagnostic-log problem must not
-        // make survey telemetry unavailable.
-        let (debug_root, debug_file) =
-            match initialize_debug_log(
-                &volume_manager,
-                survey_volume,
-            ) {
-                Some((root, file)) => {
-                    info!(
-                        "Persistent DEBUG.LOG online at level {}",
-                        PERSISTENT_LOG_LEVEL.label()
-                    );
-                    (Some(root), Some(file))
-                }
+        let session_start_ms = Instant::now().as_millis();
+        let mode_setup_started = Instant::now();
 
-                None => {
-                    warn!(
-                        "Persistent DEBUG.LOG unavailable; survey logging continues"
-                    );
-                    (None, None)
+        let (mode, debug_file) = match active_survey_id {
+            Some(survey_id) => {
+                match initialize_survey_session(
+                    &volume_manager,
+                    storage_volume,
+                    survey_id,
+                    system_info,
+                    session_start_ms,
+                ) {
+                    Some((session_dir, rx_file, local_file, event_file, session_number, debug_file)) => {
+                        info!(
+                            "Logging V2 survey session online: survey={} boot/session={}",
+                            survey_id,
+                            session_number
+                        );
+
+                        (
+                            StorageMode::Survey {
+                                session_dir,
+                                rx_file,
+                                local_file,
+                                event_file,
+                                survey_id,
+                                session_number,
+                            },
+                            debug_file,
+                        )
+                    }
+                    None => {
+                        error!(
+                            "Survey-session logging initialization failed; falling back to global DEBUG.LOG"
+                        );
+
+                        let (root_dir, debug_file) =
+                            match initialize_global_debug_log(&volume_manager, storage_volume) {
+                                Some(handles) => handles,
+                                None => {
+                                    let _ = volume_manager.close_volume(storage_volume);
+                                    return None;
+                                }
+                            };
+
+                        (StorageMode::Global { root_dir }, Some(debug_file))
+                    }
                 }
-            };
+            }
+            None => {
+                let (root_dir, debug_file) =
+                    match initialize_global_debug_log(&volume_manager, storage_volume) {
+                        Some(handles) => handles,
+                        None => {
+                            let _ = volume_manager.close_volume(storage_volume);
+                            return None;
+                        }
+                    };
+
+                info!("No active survey; persistent diagnostics using /DEBUG.LOG");
+                (StorageMode::Global { root_dir }, Some(debug_file))
+            }
+        };
+
+        let mode_setup_us = Instant::now()
+            .duration_since(mode_setup_started)
+            .as_micros();
+
+        if debug_file.is_some() {
+            info!(
+                "Persistent DEBUG.LOG online at level {}",
+                PERSISTENT_LOG_LEVEL.label()
+            );
+        } else {
+            warn!("Persistent DEBUG.LOG unavailable; survey logging continues");
+        }
+
+        let total_us = Instant::now()
+            .duration_since(total_started)
+            .as_micros();
 
         info!(
-            "GOLFER storage ready; test receiver segment={}",
-            segment_number
+            "SD_INIT_TIMING card_init_us={} syslog_us={} mount_us={} mode_setup_us={} total_us={}",
+            card_init_us,
+            syslog_us,
+            mount_us,
+            mode_setup_us,
+            total_us
         );
 
         Some(Self {
             volume_manager,
-            survey_volume,
-            survey_dir,
-            telemetry_file,
-            debug_root,
+            storage_volume,
+            mode,
             debug_file,
             debug_buffer: String::new(),
-            segment_number,
-            records_written: 0,
+            local_records_written: 0,
+            utc_anchor: None,
         })
     }
 
@@ -387,21 +514,26 @@ impl Storage {
 
         // Persistent diagnostic envelope:
         //
-        // <timestamp> <time_source> <uptime_ms> <level> <originator>
+        // <utc_unix_or_NA> <GPS|UNKNOWN> <mono_ms> <level> <originator>
         // <event_id> <message...>
         //
-        // Real wall-clock time is not wired into the logger yet. "NA UNKNOWN"
-        // is an intentional placeholder rather than fabricated UTC.
-        if write!(
-            line,
-            "NA UNKNOWN {} {} {} {}",
-            uptime_ms,
-            level.label(),
-            originator,
-            event_id,
-        )
-        .is_err()
-        {
+        // Monotonic time is always authoritative. Once GPS UTC becomes valid,
+        // the current anchor provides a human/cross-device wall-clock millisecond.
+        let utc = self.utc_for_mono_ms(uptime_ms);
+        let time_write = match utc {
+            Some(utc) => write!(
+                line,
+                "{} GPS {} {} {} {}",
+                utc, uptime_ms, level.label(), originator, event_id
+            ),
+            None => write!(
+                line,
+                "NA UNKNOWN {} {} {} {}",
+                uptime_ms, level.label(), originator, event_id
+            ),
+        };
+
+        if time_write.is_err() {
             return;
         }
 
@@ -448,187 +580,384 @@ impl Storage {
         }
     }
 
-    /// Append one received telemetry record and periodically checkpoint it.
+    /// Update the monotonic -> GPS UTC anchor.
     ///
-    /// The returned timings measure ONLY the survey telemetry operation. Any
-    /// later DEBUG.LOG batch write is outside these measurements.
-    pub fn log_receiver_packet(
+    /// Returns true the first time this boot acquires usable GPS UTC. The caller
+    /// uses that transition to append one explicit TIME_SYNC event. Subsequent
+    /// updates keep inferred UTC aligned with the latest RMC sentence without
+    /// manufacturing a new event every second.
+    pub fn update_time_anchor(
         &mut self,
-        timestamp_ms: u64,
-        sequence: u32,
-        rssi: i16,
-        snr: i16,
-        received: u32,
-        missed: u32,
-        gps: GpsState,
-    ) -> Option<TelemetryWriteStats> {
-        let mut line: String<192> = String::new();
+        mono_ms: u64,
+        unix_ms: u64,
+    ) -> bool {
+        let first_sync = self.utc_anchor.is_none();
+        self.utc_anchor = Some(UtcAnchor {
+            mono_ms,
+            unix_ms,
+        });
+        first_sync
+    }
 
+    /// Append a parser-friendly event record with a local GPS snapshot.
+    ///
+    /// EVENT.LOG is append-only. Events that conceptually annotate an earlier
+    /// RX record (for example LINK_LOST) carry references such as LAST_SEQ and
+    /// LAST_RX_MONO_MS instead of rewriting already-persisted history.
+    pub fn log_event(
+        &mut self,
+        mono_ms: u64,
+        event_id: &'static str,
+        gps: GpsState,
+        args: Arguments<'_>,
+    ) -> bool {
+        let event_file = match self.mode {
+            StorageMode::Survey { event_file, .. } => event_file,
+            StorageMode::Global { .. } => return false,
+        };
+
+        let mut line: String<512> = String::new();
+
+        if write!(line, "MONO_MS={},UTC_MS=", mono_ms).is_err() {
+            return false;
+        }
+        if append_optional_u64(&mut line, self.utc_for_mono_ms(mono_ms)).is_err() {
+            return false;
+        }
         if write!(
             line,
-            "{},SEQ={},RSSI={},SNR={},RX={},MISSED={},GPS_ONLINE={},GPS_FIX={}",
-            timestamp_ms,
-            sequence,
-            rssi,
-            snr,
-            received,
-            missed,
+            ",EVENT={},GPS_ONLINE={},GPS_FIX={},LAT_E7=",
+            event_id,
             gps.online as u8,
             gps.fix as u8,
         )
         .is_err()
         {
-            error!("Telemetry line formatting overflow");
+            return false;
+        }
+        if append_optional_i32(&mut line, gps.latitude_e7).is_err() {
+            return false;
+        }
+        if write!(line, ",LON_E7=").is_err()
+            || append_optional_i32(&mut line, gps.longitude_e7).is_err()
+        {
+            return false;
+        }
+
+        let before_details = line.len();
+        if write!(line, ",").is_err() || line.write_fmt(args).is_err() {
+            return false;
+        }
+        if line.len() == before_details + 1 {
+            line.truncate(before_details);
+        }
+        if writeln!(line).is_err() {
+            return false;
+        }
+
+        if self.volume_manager.write(event_file, line.as_bytes()).is_err() {
+            error!("EVENT.LOG write failed");
+            return false;
+        }
+
+        true
+    }
+
+    /// Append the local GOLFER state once per second regardless of RF success.
+    ///
+    /// This is the survey's continuous ground-truth track. Missing radio frames
+    /// therefore create gaps in RX.LOG while LOCAL.LOG continues through the
+    /// dead zone. BME280/battery fields are reserved now and remain NA until
+    /// those local subsystems are brought online.
+    pub fn log_local_sample(
+        &mut self,
+        mono_ms: u64,
+        gps: GpsState,
+        link_up: bool,
+        last_rssi: Option<i16>,
+        last_snr: Option<i16>,
+        received: u32,
+        missed: u32,
+        app_crc_failures: u32,
+    ) -> bool {
+        let (rx_file, local_file, event_file) = match self.mode {
+            StorageMode::Survey {
+                rx_file,
+                local_file,
+                event_file,
+                ..
+            } => (rx_file, local_file, event_file),
+            StorageMode::Global { .. } => return false,
+        };
+
+        let mut flags = LOCAL_FLAG_SURVEY_ACTIVE;
+        if gps.online {
+            flags |= LOCAL_FLAG_GPS_ONLINE;
+        }
+        if gps.fix {
+            flags |= LOCAL_FLAG_GPS_FIX;
+        }
+        if link_up {
+            flags |= LOCAL_FLAG_LINK_UP;
+        }
+
+        let mut line: String<640> = String::new();
+        if write!(line, "MONO_MS={},UTC_MS=", mono_ms).is_err()
+            || append_optional_u64(&mut line, self.utc_for_mono_ms(mono_ms)).is_err()
+            || write!(
+                line,
+                ",FLAGS={:08X},GPS_ONLINE={},GPS_FIX={},LAT_E7=",
+                flags,
+                gps.online as u8,
+                gps.fix as u8,
+            )
+            .is_err()
+            || append_optional_i32(&mut line, gps.latitude_e7).is_err()
+            || write!(line, ",LON_E7=").is_err()
+            || append_optional_i32(&mut line, gps.longitude_e7).is_err()
+            || write!(line, ",ALT_HALF_M=").is_err()
+            || append_optional_i16(&mut line, gps.altitude_half_m).is_err()
+            || write!(line, ",SPEED_CM_S=").is_err()
+            || append_optional_u16(&mut line, gps.speed_cm_s).is_err()
+            || write!(line, ",COURSE_CDEG=").is_err()
+            || append_optional_u16(&mut line, gps.course_cdeg).is_err()
+            || write!(line, ",SATS=").is_err()
+            || append_optional_u8(&mut line, gps.satellites).is_err()
+            || write!(line, ",HDOP_TENTHS=").is_err()
+            || append_optional_u8(&mut line, gps.hdop_tenths).is_err()
+            || write!(
+                line,
+                ",LINK_UP={},LAST_RSSI=",
+                link_up as u8,
+            )
+            .is_err()
+            || append_optional_i16(&mut line, last_rssi).is_err()
+            || write!(line, ",LAST_SNR=").is_err()
+            || append_optional_i16(&mut line, last_snr).is_err()
+            || writeln!(
+                line,
+                ",RX={},MISSED={},APP_CRC_FAIL={},TEMP_CENTI_C=NA,PRESSURE_10PA=NA,HUMIDITY_HALF_PCT=NA,BATTERY_SOC=NA",
+                received,
+                missed,
+                app_crc_failures,
+            )
+            .is_err()
+        {
+            error!("LOCAL.LOG line formatting overflow");
+            return false;
+        }
+
+        let append_started = Instant::now();
+        if self.volume_manager.write(local_file, line.as_bytes()).is_err() {
+            error!("LOCAL.LOG write failed");
+            return false;
+        }
+        let append_us = Instant::now().duration_since(append_started).as_micros();
+
+        self.local_records_written = self.local_records_written.saturating_add(1);
+
+        self.diag(
+            PersistentLogLevel::Trace,
+            mono_ms,
+            "STORAGE",
+            "LOCAL_APPEND",
+            format_args!("us={} bytes={}", append_us, line.len()),
+        );
+
+        // LOCAL.LOG is the 1 Hz heartbeat even when RF is absent. Every tenth
+        // local sample checkpoints all survey data products together so a dead
+        // RF zone still periodically makes RX/EVENT/DEBUG durable.
+        if self.local_records_written % 10 == 0 {
+            let checkpoint_started = Instant::now();
+            let mut ok = true;
+
+            if self.volume_manager.flush_file(local_file).is_err() {
+                ok = false;
+            }
+            if self.volume_manager.flush_file(rx_file).is_err() {
+                ok = false;
+            }
+            if self.volume_manager.flush_file(event_file).is_err() {
+                ok = false;
+            }
+            self.flush_debug_buffer(true);
+
+            let checkpoint_us = Instant::now()
+                .duration_since(checkpoint_started)
+                .as_micros();
+
+            if ok {
+                self.diag(
+                    PersistentLogLevel::Debug,
+                    mono_ms,
+                    "STORAGE",
+                    "SURVEY_CHECKPOINT",
+                    format_args!("us={}", checkpoint_us),
+                );
+            } else {
+                error!("Survey checkpoint flush failed");
+                self.diag(
+                    PersistentLogLevel::Error,
+                    mono_ms,
+                    "STORAGE",
+                    "SURVEY_CHECKPOINT_FAILED",
+                    format_args!("us={}", checkpoint_us),
+                );
+            }
+        }
+
+        true
+    }
+
+    /// Append one accepted native TelemetryV1 reception.
+    ///
+    /// RX.LOG records both sides of the observation: local position at receive
+    /// time plus the remote telemetry carried by the packet. Application CRC,
+    /// survey-context, and packet decoding have already succeeded before this
+    /// function is called.
+    pub fn log_receiver_packet(
+        &mut self,
+        mono_ms: u64,
+        telemetry: TelemetryV1,
+        rssi: i16,
+        snr: i16,
+        received: u32,
+        missed: u32,
+        app_crc_failures: u32,
+        local_gps: GpsState,
+    ) -> Option<TelemetryWriteStats> {
+        let rx_file = match self.mode {
+            StorageMode::Survey { rx_file, .. } => rx_file,
+            StorageMode::Global { .. } => return None,
+        };
+
+        let mut line: String<960> = String::new();
+
+        if write!(
+            line,
+            "MONO_MS={},UTC_MS=",
+            mono_ms,
+        )
+        .is_err()
+            || append_optional_u64(&mut line, self.utc_for_mono_ms(mono_ms)).is_err()
+            || write!(
+                line,
+                ",SEQ={},SENDER={:016X},SURVEY={:08X},MODE={},RSSI={},SNR={},RX={},MISSED={},APP_CRC_FAIL={},LOCAL_GPS_FIX={},LOCAL_LAT_E7=",
+                telemetry.sequence,
+                telemetry.sender_system_id,
+                telemetry.survey_id,
+                telemetry.sender_mode,
+                rssi,
+                snr,
+                received,
+                missed,
+                app_crc_failures,
+                local_gps.fix as u8,
+            )
+            .is_err()
+            || append_optional_i32(&mut line, local_gps.latitude_e7).is_err()
+            || write!(line, ",LOCAL_LON_E7=").is_err()
+            || append_optional_i32(&mut line, local_gps.longitude_e7).is_err()
+            || write!(line, ",TX_UTC_S=").is_err()
+            || append_optional_u32(&mut line, telemetry.gps_unix_time).is_err()
+            || write!(line, ",TX_LAT_E7=").is_err()
+            || append_optional_i32(&mut line, telemetry.latitude_e7).is_err()
+            || write!(line, ",TX_LON_E7=").is_err()
+            || append_optional_i32(&mut line, telemetry.longitude_e7).is_err()
+            || write!(line, ",TX_ALT_HALF_M=").is_err()
+            || append_optional_i16(&mut line, telemetry.altitude_half_m).is_err()
+            || write!(line, ",TX_SPEED_CM_S=").is_err()
+            || append_optional_u16(&mut line, telemetry.speed_cm_s).is_err()
+            || write!(line, ",TX_COURSE_CDEG=").is_err()
+            || append_optional_u16(&mut line, telemetry.course_cdeg).is_err()
+            || write!(
+                line,
+                ",TX_FIX={},TX_SATS={},TX_HDOP_TENTHS=",
+                telemetry.gps_fix_class as u8,
+                telemetry.satellites,
+            )
+            .is_err()
+            || append_optional_u8(&mut line, telemetry.hdop_tenths).is_err()
+            || write!(line, ",TX_TEMP_CENTI_C=").is_err()
+            || append_optional_i16(&mut line, telemetry.temperature_centi_c).is_err()
+            || write!(line, ",TX_PRESSURE_10PA=").is_err()
+            || append_optional_u16(&mut line, telemetry.pressure_10pa).is_err()
+            || write!(line, ",TX_HUMIDITY_HALF_PCT=").is_err()
+            || append_optional_u8(&mut line, telemetry.humidity_half_percent).is_err()
+            || write!(line, ",TX_BATTERY_SOC=").is_err()
+            || append_optional_u8(&mut line, telemetry.battery_soc_percent).is_err()
+            || writeln!(line).is_err()
+        {
+            error!("RX.LOG line formatting overflow");
             return None;
-        }
-
-        match gps.latitude_e7 {
-            Some(latitude_e7) => {
-                if write!(line, ",LAT_E7={}", latitude_e7).is_err() {
-                    return None;
-                }
-            }
-
-            None => {
-                if write!(line, ",LAT_E7=NA").is_err() {
-                    return None;
-                }
-            }
-        }
-
-        match gps.longitude_e7 {
-            Some(longitude_e7) => {
-                if write!(line, ",LON_E7={}", longitude_e7).is_err() {
-                    return None;
-                }
-            }
-
-            None => {
-                if write!(line, ",LON_E7=NA").is_err() {
-                    return None;
-                }
-            }
-        }
-
-        match gps.satellites {
-            Some(satellites) => {
-                if writeln!(line, ",SATS={}", satellites).is_err() {
-                    return None;
-                }
-            }
-
-            None => {
-                if writeln!(line, ",SATS=NA").is_err() {
-                    return None;
-                }
-            }
         }
 
         let append_started = Instant::now();
 
-        if self
-            .volume_manager
-            .write(self.telemetry_file, line.as_bytes())
-            .is_err()
-        {
-            error!("Telemetry SD write failed");
-
+        if self.volume_manager.write(rx_file, line.as_bytes()).is_err() {
+            error!("RX.LOG write failed");
             self.diag(
                 PersistentLogLevel::Error,
-                timestamp_ms,
+                mono_ms,
                 "STORAGE",
-                "FS_APPEND_FAILED",
+                "RX_APPEND_FAILED",
                 format_args!(""),
             );
-
             return None;
         }
 
-        let append_us =
-            Instant::now()
-                .duration_since(append_started)
-                .as_micros();
+        let append_us = Instant::now()
+            .duration_since(append_started)
+            .as_micros();
 
-        self.records_written =
-            self.records_written.saturating_add(1);
 
-        let checkpointed = self.records_written % 10 == 0;
-
-        let checkpoint_us = if checkpointed {
-            let checkpoint_started = Instant::now();
-
-            if self
-                .volume_manager
-                .flush_file(self.telemetry_file)
-                .is_err()
-            {
-                error!("Telemetry checkpoint flush failed");
-
-                self.diag(
-                    PersistentLogLevel::Error,
-                    timestamp_ms,
-                    "STORAGE",
-                    "FS_CHECKPOINT_FAILED",
-                    format_args!(""),
-                );
-
-                return None;
-            }
-
-            Some(
-                Instant::now()
-                    .duration_since(checkpoint_started)
-                    .as_micros()
-            )
-        } else {
-            None
-        };
-
-        let total_us =
-            append_us.saturating_add(checkpoint_us.unwrap_or(0));
-
-        // Normal append timing is TRACE because it occurs every packet.
         self.diag(
             PersistentLogLevel::Trace,
-            timestamp_ms,
+            mono_ms,
             "STORAGE",
-            "FS_APPEND",
-            format_args!(
-                "us={} bytes={}",
-                append_us,
-                line.len()
-            ),
+            "RX_APPEND",
+            format_args!("us={} bytes={}", append_us, line.len()),
         );
-
-        // Checkpoint timing is lower-volume and useful enough for DEBUG.
-        if let Some(checkpoint_us) = checkpoint_us {
-            self.diag(
-                PersistentLogLevel::Debug,
-                timestamp_ms,
-                "STORAGE",
-                "FS_APPEND_CHECKPOINT",
-                format_args!(
-                    "us={} append_us={} checkpoint_us={}",
-                    total_us,
-                    append_us,
-                    checkpoint_us
-                ),
-            );
-
-            // Persist the accumulated low-priority diagnostics once per normal
-            // survey checkpoint rather than touching DEBUG.LOG every second.
-            self.flush_debug_buffer(true);
-        }
 
         Some(TelemetryWriteStats {
             append_us,
-            checkpoint_us,
-            total_us,
+            checkpoint_us: None,
+            total_us: append_us,
         })
     }
 
+    fn utc_for_mono_ms(&self, mono_ms: u64) -> Option<u64> {
+        let anchor = self.utc_anchor?;
+
+        if mono_ms >= anchor.mono_ms {
+            Some(
+                anchor.unix_ms
+                    .saturating_add(mono_ms - anchor.mono_ms),
+            )
+        } else {
+            anchor.unix_ms
+                .checked_sub(anchor.mono_ms - mono_ms)
+        }
+    }
+
+    /// Boot/session number for the active survey recording. Zero means there is
+    /// currently no survey-local recording session.
     pub fn segment_number(&self) -> u32 {
-        self.segment_number
+        match self.mode {
+            StorageMode::Survey { session_number, .. } => session_number,
+            StorageMode::Global { .. } => 0,
+        }
+    }
+
+    pub fn survey_logging_active(&self) -> bool {
+        matches!(self.mode, StorageMode::Survey { .. })
+    }
+
+    pub fn active_survey_id(&self) -> Option<u32> {
+        match self.mode {
+            StorageMode::Survey { survey_id, .. } => Some(survey_id),
+            StorageMode::Global { .. } => None,
+        }
     }
 
     fn flush_debug_buffer(
@@ -676,39 +1005,103 @@ impl Drop for Storage {
             let _ = self.volume_manager.close_file(debug_file);
         }
 
-        if let Some(debug_root) = self.debug_root {
-            let _ = self.volume_manager.close_dir(debug_root);
+        match self.mode {
+            StorageMode::Survey {
+                session_dir,
+                rx_file,
+                local_file,
+                event_file,
+                ..
+            } => {
+                let _ = self.volume_manager.flush_file(rx_file);
+                let _ = self.volume_manager.flush_file(local_file);
+                let _ = self.volume_manager.flush_file(event_file);
+                let _ = self.volume_manager.close_file(rx_file);
+                let _ = self.volume_manager.close_file(local_file);
+                let _ = self.volume_manager.close_file(event_file);
+                let _ = self.volume_manager.close_dir(session_dir);
+            }
+            StorageMode::Global { root_dir } => {
+                let _ = self.volume_manager.close_dir(root_dir);
+            }
         }
 
-        let _ = self.volume_manager.flush_file(self.telemetry_file);
-        let _ = self.volume_manager.close_file(self.telemetry_file);
-        let _ = self.volume_manager.close_dir(self.survey_dir);
-        let _ = self.volume_manager.close_volume(self.survey_volume);
+        let _ = self.volume_manager.close_volume(self.storage_volume);
     }
 }
 
-fn initialize_debug_log(
+fn append_optional_u64<const N: usize>(line: &mut String<N>, value: Option<u64>) -> core::fmt::Result {
+    match value {
+        Some(value) => write!(line, "{}", value),
+        None => write!(line, "NA"),
+    }
+}
+
+fn append_optional_u32<const N: usize>(line: &mut String<N>, value: Option<u32>) -> core::fmt::Result {
+    match value {
+        Some(value) => write!(line, "{}", value),
+        None => write!(line, "NA"),
+    }
+}
+
+fn append_optional_i32<const N: usize>(line: &mut String<N>, value: Option<i32>) -> core::fmt::Result {
+    match value {
+        Some(value) => write!(line, "{}", value),
+        None => write!(line, "NA"),
+    }
+}
+
+fn append_optional_i16<const N: usize>(line: &mut String<N>, value: Option<i16>) -> core::fmt::Result {
+    match value {
+        Some(value) => write!(line, "{}", value),
+        None => write!(line, "NA"),
+    }
+}
+
+fn append_optional_u16<const N: usize>(line: &mut String<N>, value: Option<u16>) -> core::fmt::Result {
+    match value {
+        Some(value) => write!(line, "{}", value),
+        None => write!(line, "NA"),
+    }
+}
+
+fn append_optional_u8<const N: usize>(line: &mut String<N>, value: Option<u8>) -> core::fmt::Result {
+    match value {
+        Some(value) => write!(line, "{}", value),
+        None => write!(line, "NA"),
+    }
+}
+
+fn initialize_global_debug_log(
     volume_manager: &VolumeManagerImpl,
     volume: RawVolume,
 ) -> Option<(RawDirectory, RawFile)> {
     let root = volume_manager.open_root_dir(volume).ok()?;
 
-    let filename =
-        ShortFileName::create_from_str(DEBUG_LOG_FILENAME).ok()?;
+    match open_or_create_append_file(volume_manager, root, DEBUG_LOG_FILENAME) {
+        Some(file) => Some((root, file)),
+        None => {
+            let _ = volume_manager.close_dir(root);
+            None
+        }
+    }
+}
 
+fn open_or_create_append_file(
+    volume_manager: &VolumeManagerImpl,
+    dir: RawDirectory,
+    filename: &str,
+) -> Option<RawFile> {
+    let filename = ShortFileName::create_from_str(filename).ok()?;
     let mut already_exists = false;
 
-    if volume_manager
-        .iterate_dir(root, |entry| {
+    volume_manager
+        .iterate_dir(dir, |entry| {
             if entry.name == filename {
                 already_exists = true;
             }
         })
-        .is_err()
-    {
-        let _ = volume_manager.close_dir(root);
-        return None;
-    }
+        .ok()?;
 
     let mode = if already_exists {
         Mode::ReadWriteAppend
@@ -716,21 +1109,7 @@ fn initialize_debug_log(
         Mode::ReadWriteCreate
     };
 
-    let file =
-        match volume_manager.open_file_in_dir(
-            root,
-            &filename,
-            mode,
-        ) {
-            Ok(file) => file,
-
-            Err(_) => {
-                let _ = volume_manager.close_dir(root);
-                return None;
-            }
-        };
-
-    Some((root, file))
+    volume_manager.open_file_in_dir(dir, &filename, mode).ok()
 }
 
 fn initialize_system_log(
@@ -855,121 +1234,271 @@ fn initialize_system_log(
     true
 }
 
-/// Create/open:
+/// Create one Logging V2 survey boot/session:
 ///
-///     /SURVEY/A0000001/
+///     /SURVEY/Axxxxxxx/Bxxxxxxx/
+///         RX.LOG
+///         LOCAL.LOG
+///         EVENT.LOG
+///         DEBUG.LOG
+///         META.TXT
 ///
-/// Then scan for Rxxxxxxx.LOG and create the next segment.
-///
-/// The returned volume, survey directory and telemetry file intentionally stay
-/// open for the duration of this boot.
-fn initialize_test_survey_log(
+/// Bxxxxxxx is an ergonomic recording/boot distinction only. The Survey ID is
+/// canonical and survives reboot/power loss.
+fn initialize_survey_session(
     volume_manager: &VolumeManagerImpl,
-) -> Option<(RawVolume, RawDirectory, RawFile, u32)> {
-    let volume = match volume_manager.open_raw_volume(VolumeIdx(0)) {
-        Ok(volume) => volume,
-        Err(_) => {
-            error!("Failed to mount FAT volume for test survey");
-            return None;
-        }
-    };
-
+    volume: RawVolume,
+    survey_id: u32,
+    system_info: SystemInfo,
+    start_mono_ms: u64,
+) -> Option<(RawDirectory, RawFile, RawFile, RawFile, u32, Option<RawFile>)> {
     let root = match volume_manager.open_root_dir(volume) {
         Ok(root) => root,
         Err(_) => {
-            error!("Failed to open root for test survey");
-            let _ = volume_manager.close_volume(volume);
+            error!("Failed to open root for survey session");
             return None;
         }
     };
 
-    let survey_root =
-        match ensure_directory(volume_manager, root, SURVEY_ROOT_DIR) {
-            Some(dir) => dir,
-            None => {
-                error!("Failed to ensure /SURVEY");
-                let _ = volume_manager.close_dir(root);
-                let _ = volume_manager.close_volume(volume);
-                return None;
-            }
-        };
+    let survey_root = match ensure_directory(volume_manager, root, SURVEY_ROOT_DIR) {
+        Some(dir) => dir,
+        None => {
+            error!("Failed to ensure /SURVEY");
+            let _ = volume_manager.close_dir(root);
+            return None;
+        }
+    };
 
     let _ = volume_manager.close_dir(root);
 
-    let survey_dir =
-        match ensure_directory(volume_manager, survey_root, TEST_SURVEY_ID) {
-            Some(dir) => dir,
-            None => {
-                error!("Failed to ensure /SURVEY/A0000001");
-                let _ = volume_manager.close_dir(survey_root);
-                let _ = volume_manager.close_volume(volume);
-                return None;
-            }
-        };
+    let survey_name = match survey_directory_name(survey_id) {
+        Some(name) => name,
+        None => {
+            error!("Failed to format survey directory name");
+            let _ = volume_manager.close_dir(survey_root);
+            return None;
+        }
+    };
+    let survey_dir = match ensure_directory(volume_manager, survey_root, survey_name.as_str()) {
+        Some(dir) => dir,
+        None => {
+            error!("Failed to ensure survey directory {}", survey_name.as_str());
+            let _ = volume_manager.close_dir(survey_root);
+            return None;
+        }
+    };
 
     let _ = volume_manager.close_dir(survey_root);
 
-    let highest_segment =
-        match find_highest_receiver_segment(
-            volume_manager,
-            survey_dir,
-        ) {
-            Some(segment) => segment,
-            None => {
-                error!("Failed to scan survey directory");
-                let _ = volume_manager.close_dir(survey_dir);
-                let _ = volume_manager.close_volume(volume);
-                return None;
-            }
-        };
+    // Allocate the next boot/session from a tiny persistent counter rather than
+    // scanning every Bxxxxxxx directory on every boot. Existing V2A surveys do
+    // not yet have BOOT.NXT, so the allocator performs one compatibility scan,
+    // seeds the counter, and uses O(1) allocation on subsequent boots.
+    //
+    // The *following* number is flushed before the session directory is
+    // created. A sudden power loss can therefore leave a harmless numbering
+    // gap, but it cannot cause a later boot to reuse an already allocated
+    // session number.
+    let next_session = match allocate_boot_session(volume_manager, survey_dir) {
+        Some(session) => session,
+        None => {
+            error!("Failed to allocate boot/session number");
+            let _ = volume_manager.close_dir(survey_dir);
+            return None;
+        }
+    };
 
-    let next_segment = highest_segment.saturating_add(1);
+    let session_name = match boot_session_directory_name(next_session) {
+        Some(name) => name,
+        None => {
+            error!("Failed to format boot/session directory name");
+            let _ = volume_manager.close_dir(survey_dir);
+            return None;
+        }
+    };
 
-    if next_segment > 9_999_999 {
-        error!("Receiver segment number exhausted");
+    if volume_manager
+        .make_dir_in_dir(survey_dir, session_name.as_str())
+        .is_err()
+    {
+        error!("Failed to create boot/session directory {}", session_name.as_str());
         let _ = volume_manager.close_dir(survey_dir);
-        let _ = volume_manager.close_volume(volume);
         return None;
     }
 
-    let filename =
-        match receiver_segment_filename(next_segment) {
-            Some(name) => name,
-            None => {
-                error!("Failed to format receiver segment filename");
-                let _ = volume_manager.close_dir(survey_dir);
-                let _ = volume_manager.close_volume(volume);
-                return None;
-            }
-        };
+    let session_dir = match volume_manager.open_dir(survey_dir, session_name.as_str()) {
+        Ok(dir) => dir,
+        Err(_) => {
+            error!("Failed to open boot/session directory {}", session_name.as_str());
+            let _ = volume_manager.close_dir(survey_dir);
+            return None;
+        }
+    };
 
-    let telemetry_file =
-        match volume_manager.open_file_in_dir(
-            survey_dir,
-            &filename,
-            Mode::ReadWriteCreate,
-        ) {
-            Ok(file) => file,
+    let _ = volume_manager.close_dir(survey_dir);
 
-            Err(_) => {
-                error!("Failed to create receiver telemetry segment");
-                let _ = volume_manager.close_dir(survey_dir);
-                let _ = volume_manager.close_volume(volume);
-                return None;
-            }
-        };
+    // V2B keeps the three survey data products open for the lifetime of this
+    // boot/session. All are append-only; a 10-second LOCAL.LOG heartbeat
+    // checkpoints RX/LOCAL/EVENT/DEBUG together.
+    let local_file = match open_or_create_append_file(
+        volume_manager, session_dir, LOCAL_LOG_FILENAME
+    ) {
+        Some(file) => file,
+        None => {
+            error!("Failed to create LOCAL.LOG");
+            let _ = volume_manager.close_dir(session_dir);
+            return None;
+        }
+    };
+
+    let event_file = match open_or_create_append_file(
+        volume_manager, session_dir, EVENT_LOG_FILENAME
+    ) {
+        Some(file) => file,
+        None => {
+            error!("Failed to create EVENT.LOG");
+            let _ = volume_manager.close_file(local_file);
+            let _ = volume_manager.close_dir(session_dir);
+            return None;
+        }
+    };
+
+    if !create_metadata_file(
+        volume_manager,
+        session_dir,
+        survey_id,
+        next_session,
+        system_info,
+        start_mono_ms,
+    ) {
+        error!("Failed to create META.TXT");
+        let _ = volume_manager.close_file(event_file);
+        let _ = volume_manager.close_file(local_file);
+        let _ = volume_manager.close_dir(session_dir);
+        return None;
+    }
+
+    let rx_name = match ShortFileName::create_from_str(RX_LOG_FILENAME) {
+        Ok(name) => name,
+        Err(_) => {
+            error!("Internal RX.LOG filename is invalid");
+            let _ = volume_manager.close_file(event_file);
+            let _ = volume_manager.close_file(local_file);
+            let _ = volume_manager.close_dir(session_dir);
+            return None;
+        }
+    };
+    let rx_file = match volume_manager.open_file_in_dir(
+        session_dir,
+        &rx_name,
+        Mode::ReadWriteCreate,
+    ) {
+        Ok(file) => file,
+        Err(_) => {
+            error!("Failed to create RX.LOG");
+            let _ = volume_manager.close_file(event_file);
+            let _ = volume_manager.close_file(local_file);
+            let _ = volume_manager.close_dir(session_dir);
+            return None;
+        }
+    };
+
+    // DEBUG.LOG is intentionally optional. RX logging remains available if the
+    // diagnostic file itself cannot be created.
+    let debug_file = match open_or_create_append_file(
+        volume_manager,
+        session_dir,
+        DEBUG_LOG_FILENAME,
+    ) {
+        Some(file) => Some(file),
+        None => {
+            warn!("Failed to create survey/session DEBUG.LOG");
+            None
+        }
+    };
 
     info!(
-        "Test survey active: /SURVEY/A0000001 segment={}",
-        next_segment
+        "Test survey active: /SURVEY/{}/{}",
+        survey_name.as_str(),
+        session_name.as_str()
     );
 
-    Some((
-        volume,
-        survey_dir,
-        telemetry_file,
-        next_segment,
-    ))
+    Some((session_dir, rx_file, local_file, event_file, next_session, debug_file))
+}
+
+fn create_metadata_file(
+    volume_manager: &VolumeManagerImpl,
+    dir: RawDirectory,
+    survey_id: u32,
+    session_number: u32,
+    system_info: SystemInfo,
+    start_mono_ms: u64,
+) -> bool {
+    let name = match ShortFileName::create_from_str(META_FILENAME) {
+        Ok(name) => name,
+        Err(_) => return false,
+    };
+
+    let file = match volume_manager.open_file_in_dir(dir, &name, Mode::ReadWriteCreate) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+
+    let mut metadata: String<512> = String::new();
+    let session_name = match boot_session_directory_name(session_number) {
+        Some(name) => name,
+        None => {
+            let _ = volume_manager.close_file(file);
+            return false;
+        }
+    };
+
+    if write!(
+        metadata,
+        "LOG_SCHEMA={}\r\nIMPLEMENTATION_STAGE=V2B1\r\nSURVEY_ID={:08X}\r\nSYSTEM_ID={:016X}\r\nBOOT_SESSION={}\r\nSESSION_DIR={}\r\nFIRMWARE={}\r\nRF_PROTOCOL={}\r\nCONFIG_SCHEMA={}\r\nSTART_MONO_MS={}\r\nTIME_MODEL=MONOTONIC_PLUS_GPS_UTC_ANCHOR\r\nLOCAL_SAMPLE_HZ=1\r\nRX_PACKET_FORMAT=TELEMETRY_V1\r\n",
+        LOG_SCHEMA_VERSION,
+        survey_id,
+        system_info.system_id.value,
+        session_number,
+        session_name.as_str(),
+        system_info.firmware_version.value,
+        system_info.protocol_version.value,
+        system_info.config_version.value,
+        start_mono_ms,
+    )
+    .is_err()
+    {
+        let _ = volume_manager.close_file(file);
+        return false;
+    }
+
+    if volume_manager.write(file, metadata.as_bytes()).is_err() {
+        let _ = volume_manager.close_file(file);
+        return false;
+    }
+
+    if volume_manager.flush_file(file).is_err() {
+        let _ = volume_manager.close_file(file);
+        return false;
+    }
+
+    volume_manager.close_file(file).is_ok()
+}
+
+fn survey_directory_name(survey_id: u32) -> Option<String<8>> {
+    let mut name: String<8> = String::new();
+    write!(name, "{:08X}", survey_id).ok()?;
+    Some(name)
+}
+
+fn boot_session_directory_name(session: u32) -> Option<String<8>> {
+    if session == 0 || session > MAX_BOOT_SESSION {
+        return None;
+    }
+
+    let mut name: String<8> = String::new();
+    write!(name, "B{:07}", session).ok()?;
+    Some(name)
 }
 
 fn ensure_directory(
@@ -998,7 +1527,176 @@ fn ensure_directory(
     }
 }
 
-fn find_highest_receiver_segment(
+fn allocate_boot_session(
+    volume_manager: &VolumeManagerImpl,
+    survey_dir: RawDirectory,
+) -> Option<u32> {
+    let mut recovered_from_scan = false;
+
+    let mut next_session = match read_boot_session_counter(volume_manager, survey_dir) {
+        Some(value) if value >= 1 && value <= MAX_BOOT_SESSION => {
+            info!("Boot/session counter loaded: next={}", value);
+            value
+        }
+        Some(value) => {
+            warn!(
+                "Boot/session counter invalid/exhausted: value={}; recovering from directory scan",
+                value
+            );
+            recovered_from_scan = true;
+            find_highest_boot_session(volume_manager, survey_dir)?
+                .saturating_add(1)
+        }
+        None => {
+            info!(
+                "Boot/session counter unavailable; performing one-time directory scan"
+            );
+            recovered_from_scan = true;
+            find_highest_boot_session(volume_manager, survey_dir)?
+                .saturating_add(1)
+        }
+    };
+
+    if next_session == 0 || next_session > MAX_BOOT_SESSION {
+        return None;
+    }
+
+    // If BOOT.NXT was stale but syntactically valid, avoid a collision. This
+    // should be rare; recover with a full directory scan and repair the counter.
+    if boot_session_directory_exists(volume_manager, survey_dir, next_session) {
+        warn!(
+            "Boot/session counter collision at {}; recovering from directory scan",
+            next_session
+        );
+        recovered_from_scan = true;
+        next_session = find_highest_boot_session(volume_manager, survey_dir)?
+            .saturating_add(1);
+    }
+
+    if next_session == 0 || next_session > MAX_BOOT_SESSION {
+        return None;
+    }
+
+    let following_session = next_session.saturating_add(1);
+
+    if !write_boot_session_counter(volume_manager, survey_dir, following_session) {
+        error!("Failed to persist BOOT.NXT");
+        return None;
+    }
+
+    if recovered_from_scan {
+        info!(
+            "Boot/session counter recovered: allocated={} next={}",
+            next_session,
+            following_session
+        );
+    } else {
+        info!(
+            "Boot/session allocated: current={} next={}",
+            next_session,
+            following_session
+        );
+    }
+
+    Some(next_session)
+}
+
+fn read_boot_session_counter(
+    volume_manager: &VolumeManagerImpl,
+    survey_dir: RawDirectory,
+) -> Option<u32> {
+    let name = ShortFileName::create_from_str(BOOT_COUNTER_FILENAME).ok()?;
+    let file = volume_manager
+        .open_file_in_dir(survey_dir, &name, Mode::ReadOnly)
+        .ok()?;
+
+    let mut bytes = [0u8; 16];
+    let result = volume_manager.read(file, &mut bytes);
+    let _ = volume_manager.close_file(file);
+
+    let len = result.ok()?;
+    if len == 0 {
+        return None;
+    }
+
+    let mut value: u32 = 0;
+    let mut saw_digit = false;
+
+    for byte in &bytes[..len] {
+        if byte.is_ascii_digit() {
+            saw_digit = true;
+            value = value
+                .checked_mul(10)?
+                .checked_add(u32::from(*byte - b'0'))?;
+        } else if matches!(*byte, b'\r' | b'\n' | b' ' | b'\t') {
+            if saw_digit {
+                break;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    saw_digit.then_some(value)
+}
+
+fn write_boot_session_counter(
+    volume_manager: &VolumeManagerImpl,
+    survey_dir: RawDirectory,
+    next_session: u32,
+) -> bool {
+    let name = match ShortFileName::create_from_str(BOOT_COUNTER_FILENAME) {
+        Ok(name) => name,
+        Err(_) => return false,
+    };
+
+    let file = match volume_manager.open_file_in_dir(
+        survey_dir,
+        &name,
+        Mode::ReadWriteCreateOrTruncate,
+    ) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+
+    let mut contents: String<16> = String::new();
+    if writeln!(contents, "{:08}", next_session).is_err() {
+        let _ = volume_manager.close_file(file);
+        return false;
+    }
+
+    if volume_manager.write(file, contents.as_bytes()).is_err() {
+        let _ = volume_manager.close_file(file);
+        return false;
+    }
+
+    if volume_manager.flush_file(file).is_err() {
+        let _ = volume_manager.close_file(file);
+        return false;
+    }
+
+    volume_manager.close_file(file).is_ok()
+}
+
+fn boot_session_directory_exists(
+    volume_manager: &VolumeManagerImpl,
+    survey_dir: RawDirectory,
+    session: u32,
+) -> bool {
+    let Some(name) = boot_session_directory_name(session) else {
+        return false;
+    };
+
+    match volume_manager.open_dir(survey_dir, name.as_str()) {
+        Ok(dir) => {
+            let _ = volume_manager.close_dir(dir);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn find_highest_boot_session(
     volume_manager: &VolumeManagerImpl,
     survey_dir: RawDirectory,
 ) -> Option<u32> {
@@ -1006,22 +1704,16 @@ fn find_highest_receiver_segment(
 
     if volume_manager
         .iterate_dir(survey_dir, |entry| {
-            if entry.attributes.is_directory() {
-                return;
-            }
-
-            if entry.name.extension() != RECEIVER_LOG_EXTENSION {
+            if !entry.attributes.is_directory() {
                 return;
             }
 
             let base = entry.name.base_name();
-
-            if base.len() != 8 || base[0] != RECEIVER_LOG_PREFIX {
+            if base.len() != 8 || base[0] != BOOT_SESSION_PREFIX {
                 return;
             }
 
             let mut value: u32 = 0;
-
             for digit in &base[1..] {
                 if !digit.is_ascii_digit() {
                     return;
@@ -1042,22 +1734,4 @@ fn find_highest_receiver_segment(
     }
 
     Some(highest)
-}
-
-fn receiver_segment_filename(
-    segment: u32,
-) -> Option<ShortFileName> {
-    let mut filename: String<13> = String::new();
-
-    if write!(
-        filename,
-        "R{:07}.LOG",
-        segment
-    )
-    .is_err()
-    {
-        return None;
-    }
-
-    ShortFileName::create_from_str(filename.as_str()).ok()
 }

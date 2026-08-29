@@ -39,6 +39,16 @@ const LINK_LOSS_TIMEOUT_SECS: u64 = 5;
 // applied only to the Embassy channel, never to the SX1262 receive future.
 const LINK_WATCHDOG_INTERVAL_MS: u64 = 250;
 
+// LOCAL.LOG is independent of RF reception and continuously samples this
+// GOLFER's own state so dead zones remain visible as traveled-but-no-RX.
+const LOCAL_SAMPLE_INTERVAL_MS: u64 = 1_000;
+
+// GPS UTC is not authoritative merely because one RMC sentence parses. Cold
+// receivers can briefly report provisional calendar state. Require two
+// consecutive plausible timestamps whose progression agrees with monotonic
+// time before establishing TIME_SYNC, then reject later discontinuities.
+const GPS_UTC_PROGRESS_TOLERANCE_MS: u64 = 2_000;
+
 // Sequence/time comparison is now DIAGNOSTIC ONLY.
 //
 // A suspicious forward jump is never permanently rejected. Instead, it becomes
@@ -63,7 +73,7 @@ const REBOOT_SEQUENCE_WINDOW: u32 = 10;
 // -----------------------------------------------------------------------------
 
 const TEST_EXPECTED_SENDER_SYSTEM_ID: u64 = 0x4D52_5500_0000_0001;
-const TEST_EXPECTED_SURVEY_ID: u32 = 0xA000_0001;
+const TEST_EXPECTED_SURVEY_ID: u32 = storage::TEST_SURVEY_ID;
 
 // -----------------------------------------------------------------------------
 // TEMPORARY BUTTON/AUDIO BRING-UP POLICY
@@ -139,6 +149,24 @@ async fn button_audio_test_task() {
             audio::stop().await;
         }
     }
+}
+
+fn gps_utc_progression_is_sane(
+    previous_mono_ms: u64,
+    previous_utc_ms: u64,
+    current_mono_ms: u64,
+    current_utc_ms: u64,
+) -> bool {
+    let Some(mono_delta_ms) = current_mono_ms.checked_sub(previous_mono_ms) else {
+        return false;
+    };
+    let Some(utc_delta_ms) = current_utc_ms.checked_sub(previous_utc_ms) else {
+        return false;
+    };
+
+    mono_delta_ms > 0
+        && utc_delta_ms > 0
+        && mono_delta_ms.abs_diff(utc_delta_ms) <= GPS_UTC_PROGRESS_TOLERANCE_MS
 }
 
 #[embassy_executor::main(
@@ -242,8 +270,25 @@ async fn main(spawner: Spawner) {
 
     spi0_bus::set_frequency(spi0_bus, spi0_bus::SD_INIT_FREQUENCY_HZ);
 
-    let mut storage = if storage::card_present(spi0_bus, &mut sd_cs) {
-        storage::Storage::init(spi0_bus, sd_cs)
+    let presence_probe_started = Instant::now();
+    let sd_present = storage::card_present(spi0_bus, &mut sd_cs);
+    let presence_probe_us = Instant::now()
+        .duration_since(presence_probe_started)
+        .as_micros();
+
+    info!(
+        "SD_INIT_TIMING presence_probe_us={} present={}",
+        presence_probe_us,
+        sd_present
+    );
+
+    let mut storage = if sd_present {
+        storage::Storage::init(
+            spi0_bus,
+            sd_cs,
+            system.info(),
+            Some(storage::TEST_SURVEY_ID),
+        )
     } else {
         None
     };
@@ -282,10 +327,17 @@ async fn main(spawner: Spawner) {
             format_args!("result=OK"),
         );
 
-        info!(
-            "Receiver telemetry logging enabled: segment={}",
-            storage_ref.segment_number()
-        );
+        if storage_ref.survey_logging_active() {
+            info!(
+                "Receiver logging V2B enabled: survey={} boot/session={}",
+                storage_ref.active_survey_id().unwrap_or(0),
+                storage_ref.segment_number()
+            );
+        } else {
+            warn!(
+                "SD online but survey-session logging unavailable; using global diagnostics only"
+            );
+        }
     } else {
         display.set_init_status(InitSubsystem::SdCard, InitStatus::Nok);
 
@@ -296,7 +348,7 @@ async fn main(spawner: Spawner) {
     // GPS
     //
     // gps.rs listens to PA1616S TX on GP1 / UART0 RX, keeps raw NMEA logging,
-    // parses GGA into a latest GpsState, and publishes that state through an
+    // merges GGA/RMC into a latest GpsState, and publishes that state through an
     // Embassy Signal. GP0 remains reserved for Pico -> GPS TX later.
     // -------------------------------------------------------------------------
 
@@ -442,8 +494,15 @@ async fn main(spawner: Spawner) {
     // Retain the newest GPS state so every accepted radio packet can snapshot
     // local position into its telemetry record.
     let mut latest_gps_state = gps::GpsState::offline();
+    let mut last_gps_utc_seen: Option<u64> = None;
+    let mut pending_gps_utc: Option<(u64, u64)> = None;
+    let mut accepted_gps_utc: Option<(u64, u64)> = None;
+    let mut last_local_sample_ms: u64 = 0;
 
     let mut last_sequence: Option<u32> = None;
+    // Exact sequence of the most recently accepted packet, separate from the
+    // trusted sequence baseline used by probation/resync bookkeeping.
+    let mut last_accepted_sequence: Option<u32> = None;
 
     // Time associated with last_sequence specifically. This must remain
     // separate from last_valid_rx_time because a suspicious-but-received packet
@@ -486,6 +545,8 @@ async fn main(spawner: Spawner) {
         // ---------------------------------------------------------------------
 
         if let Some(gps_state) = gps::GPS_STATE_SIGNAL.try_take() {
+            let previous_online = latest_gps_state.online;
+            let previous_fix = latest_gps_state.fix;
             latest_gps_state = gps_state;
 
             display.update_gps(GpsDisplayState {
@@ -495,6 +556,161 @@ async fn main(spawner: Spawner) {
                 longitude_e7: gps_state.longitude_e7,
                 satellites: gps_state.satellites,
             });
+
+            let gps_mono_ms = Instant::now().as_millis();
+
+            // RMC gives us candidate UTC date+time. A single parseable RMC is
+            // not enough to establish wall-clock time: cold GPS receivers can
+            // briefly emit provisional calendar state. gps.rs rejects obviously
+            // implausible years; here we additionally require two consecutive
+            // candidates whose UTC progression agrees with monotonic time.
+            //
+            // After synchronization, every new RMC is checked against the last
+            // accepted UTC/monotonic pair before the anchor is refreshed. A
+            // discontinuous but syntactically plausible clock jump is logged and
+            // ignored rather than silently moving the survey timeline.
+            if let Some(utc_ms) = gps_state.utc_unix_ms {
+                if last_gps_utc_seen != Some(utc_ms) {
+                    last_gps_utc_seen = Some(utc_ms);
+
+                    if let Some((accepted_mono_ms, accepted_utc_ms)) = accepted_gps_utc {
+                        if gps_utc_progression_is_sane(
+                            accepted_mono_ms,
+                            accepted_utc_ms,
+                            gps_mono_ms,
+                            utc_ms,
+                        ) {
+                            accepted_gps_utc = Some((gps_mono_ms, utc_ms));
+
+                            if let Some(storage) = storage.as_mut() {
+                                storage.update_time_anchor(gps_mono_ms, utc_ms);
+                            }
+                        } else if let Some(storage) = storage.as_mut() {
+                            storage.log_event(
+                                gps_mono_ms,
+                                "GPS_UTC_REJECTED",
+                                gps_state,
+                                format_args!(
+                                    "REASON=DISCONTINUITY,CANDIDATE_UTC_MS={},PREV_UTC_MS={},PREV_MONO_MS={}",
+                                    utc_ms,
+                                    accepted_utc_ms,
+                                    accepted_mono_ms
+                                ),
+                            );
+
+                            storage.diag(
+                                PersistentLogLevel::Warn,
+                                gps_mono_ms,
+                                "TIME",
+                                "GPS_UTC_REJECTED",
+                                format_args!(
+                                    "candidate_utc_ms={} prev_utc_ms={} prev_mono_ms={}",
+                                    utc_ms,
+                                    accepted_utc_ms,
+                                    accepted_mono_ms
+                                ),
+                            );
+                        }
+                    } else if let Some((candidate_mono_ms, candidate_utc_ms)) = pending_gps_utc {
+                        if gps_utc_progression_is_sane(
+                            candidate_mono_ms,
+                            candidate_utc_ms,
+                            gps_mono_ms,
+                            utc_ms,
+                        ) {
+                            pending_gps_utc = None;
+                            accepted_gps_utc = Some((gps_mono_ms, utc_ms));
+
+                            if let Some(storage) = storage.as_mut() {
+                                let first_sync = storage.update_time_anchor(gps_mono_ms, utc_ms);
+
+                                if first_sync {
+                                    storage.log_event(
+                                        gps_mono_ms,
+                                        "TIME_SYNC",
+                                        gps_state,
+                                        format_args!(
+                                            "SOURCE=GPS_RMC_CONFIRMED,UTC_ANCHOR_MS={},MONO_ANCHOR_MS={},CONFIRMED_SAMPLES=2",
+                                            utc_ms,
+                                            gps_mono_ms
+                                        ),
+                                    );
+
+                                    storage.diag(
+                                        PersistentLogLevel::Info,
+                                        gps_mono_ms,
+                                        "TIME",
+                                        "GPS_UTC_SYNC",
+                                        format_args!(
+                                            "utc_ms={} mono_ms={} confirmed_samples=2",
+                                            utc_ms,
+                                            gps_mono_ms
+                                        ),
+                                    );
+                                }
+                            }
+                        } else {
+                            // This candidate pair did not progress like a real
+                            // clock. Treat the newest plausible value as a fresh
+                            // first candidate and wait for one more RMC.
+                            pending_gps_utc = Some((gps_mono_ms, utc_ms));
+                        }
+                    } else {
+                        pending_gps_utc = Some((gps_mono_ms, utc_ms));
+                    }
+                }
+            }
+
+            if (!previous_online && gps_state.fix) || (previous_online && !previous_fix && gps_state.fix) {
+                if let Some(storage) = storage.as_mut() {
+                    storage.log_event(
+                        gps_mono_ms,
+                        "GPS_FIX_ACQUIRED",
+                        gps_state,
+                        format_args!(""),
+                    );
+                }
+            } else if previous_online && previous_fix && !gps_state.fix {
+                if let Some(storage) = storage.as_mut() {
+                    storage.log_event(
+                        gps_mono_ms,
+                        "GPS_FIX_LOST",
+                        gps_state,
+                        format_args!(""),
+                    );
+                }
+            }
+        }
+
+        // LOCAL.LOG is a survey heartbeat, not a side effect of successful RF.
+        // This keeps the traveled GPS path and local state continuous through
+        // complete radio outages.
+        let sample_now = Instant::now();
+        let sample_mono_ms = sample_now.as_millis();
+
+        if sample_mono_ms.saturating_sub(last_local_sample_ms) >= LOCAL_SAMPLE_INTERVAL_MS {
+            let link_up = last_valid_rx_time
+                .map(|last| sample_now.duration_since(last).as_secs() < LINK_LOSS_TIMEOUT_SECS)
+                .unwrap_or(false);
+
+            if let Some(storage) = storage.as_mut() {
+                if storage.survey_logging_active() {
+                    if !storage.log_local_sample(
+                        sample_mono_ms,
+                        latest_gps_state,
+                        link_up,
+                        last_rssi,
+                        last_snr,
+                        received_packets,
+                        missed_packets,
+                        crc_failures,
+                    ) {
+                        warn!("LOCAL.LOG sample write FAILED");
+                    }
+                }
+            }
+
+            last_local_sample_ms = sample_mono_ms;
         }
 
         let rx_result = with_timeout(
@@ -551,6 +767,20 @@ async fn main(spawner: Spawner) {
                                     "APP_CRC_FAILED",
                                     format_args!(
                                         "count={} rssi={} snr={} stored_crc={} computed_crc={}",
+                                        crc_failures,
+                                        packet_status.rssi,
+                                        packet_status.snr,
+                                        stored_crc,
+                                        computed_crc
+                                    ),
+                                );
+
+                                storage.log_event(
+                                    now.as_millis(),
+                                    "APP_CRC_FAILED",
+                                    latest_gps_state,
+                                    format_args!(
+                                        "COUNT={},RSSI={},SNR={},STORED_CRC={},COMPUTED_CRC={}",
                                         crc_failures,
                                         packet_status.rssi,
                                         packet_status.snr,
@@ -879,6 +1109,7 @@ async fn main(spawner: Spawner) {
                 // logged without immediately becoming the trusted sequence
                 // baseline. Invalid/CRC-failed/foreign packets never reach here.
                 received_packets = received_packets.saturating_add(1);
+                last_accepted_sequence = Some(sequence);
 
                 if trust_sequence_now {
                     last_sequence = Some(sequence);
@@ -886,6 +1117,7 @@ async fn main(spawner: Spawner) {
                 }
 
                 let link_was_lost = link_lost_displayed;
+                let previous_last_valid_rx_time = last_valid_rx_time;
 
                 last_valid_rx_time = Some(now);
                 last_rssi = Some(packet_status.rssi);
@@ -905,22 +1137,21 @@ async fn main(spawner: Spawner) {
                 );
 
                 // -------------------------------------------------------------
-                // TEMPORARY RECEIVER TELEMETRY LOGGING TEST
+                // LOGGING V2B ACCEPTED RX RECORD
                 //
-                // One synchronous FAT append for every accepted LoRa packet.
-                // The file remains open between packets. We deliberately do NOT
-                // flush each record; tonight we care about raw append latency
-                // and whether it interferes with continuous reception.
+                // RX.LOG receives one append for every accepted native survey packet.
+                // LOCAL.LOG checkpoints all survey products every ten seconds.
                 // -------------------------------------------------------------
 
                 if let Some(storage) = storage.as_mut() {
                     let write_result = storage.log_receiver_packet(
                         now.as_millis(),
-                        sequence,
+                        telemetry,
                         packet_status.rssi,
                         packet_status.snr,
                         received_packets,
                         missed_packets,
+                        crc_failures,
                         latest_gps_state,
                     );
 
@@ -966,6 +1197,27 @@ async fn main(spawner: Spawner) {
                 ));
 
                 if link_was_lost {
+                    if let Some(storage) = storage.as_mut() {
+                        let outage_ms = previous_last_valid_rx_time
+                            .map(|last| now.duration_since(last).as_millis())
+                            .unwrap_or(0);
+                        let previous_rx_mono_ms = previous_last_valid_rx_time
+                            .map(|last| last.as_millis())
+                            .unwrap_or(0);
+
+                        storage.log_event(
+                            now.as_millis(),
+                            "LINK_REACQUIRED",
+                            latest_gps_state,
+                            format_args!(
+                                "SEQ={},OUTAGE_MS={},PREV_LAST_RX_MONO_MS={}",
+                                sequence,
+                                outage_ms,
+                                previous_rx_mono_ms
+                            ),
+                        );
+                    }
+
                     audio::play_ui_sound(audio::UiSound::LinkReacquired).await;
                     info!("Link reacquisition sound queued");
                 }
@@ -987,7 +1239,9 @@ async fn main(spawner: Spawner) {
                     continue;
                 };
 
-                let link_age_secs = Instant::now().duration_since(last_rx_time).as_secs();
+                let loss_now = Instant::now();
+                let link_age_ms = loss_now.duration_since(last_rx_time).as_millis();
+                let link_age_secs = link_age_ms / 1_000;
 
                 if link_age_secs < LINK_LOSS_TIMEOUT_SECS {
                     continue;
@@ -1000,6 +1254,21 @@ async fn main(spawner: Spawner) {
                 }
 
                 warn!("LINK LOST: no valid packet for {} seconds", link_age_secs);
+
+                if let Some(storage) = storage.as_mut() {
+                    let last_seq_value = last_accepted_sequence.unwrap_or(0);
+                    storage.log_event(
+                        loss_now.as_millis(),
+                        "LINK_LOST",
+                        latest_gps_state,
+                        format_args!(
+                            "LAST_SEQ={},LAST_RX_MONO_MS={},AGE_MS={}",
+                            last_seq_value,
+                            last_rx_time.as_millis(),
+                            link_age_ms
+                        ),
+                    );
+                }
 
                 display.update_radio(RadioDisplayState::lost(
                     last_sequence,
