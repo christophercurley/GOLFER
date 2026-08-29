@@ -497,7 +497,10 @@ async fn main(spawner: Spawner) {
     let mut last_gps_utc_seen: Option<u64> = None;
     let mut pending_gps_utc: Option<(u64, u64)> = None;
     let mut accepted_gps_utc: Option<(u64, u64)> = None;
-    let mut last_local_sample_ms: u64 = 0;
+    // Fixed-deadline scheduler for LOCAL.LOG. Advance from the previous
+    // deadline rather than from the actual write time so ordinary loop/storage
+    // jitter cannot accumulate into long-term sampling drift.
+    let mut next_local_sample_ms: u64 = Instant::now().as_millis();
 
     let mut last_sequence: Option<u32> = None;
     // Exact sequence of the most recently accepted packet, separate from the
@@ -685,10 +688,17 @@ async fn main(spawner: Spawner) {
         // LOCAL.LOG is a survey heartbeat, not a side effect of successful RF.
         // This keeps the traveled GPS path and local state continuous through
         // complete radio outages.
+        //
+        // IMPORTANT: schedule from a fixed deadline, not from the previous
+        // actual sample time. The older "now - last >= 1000 ms" scheme was
+        // serviced by this loop's 250 ms watchdog and therefore commonly
+        // produced ~1.24-1.25 s intervals. Fixed deadlines eliminate that
+        // accumulated phase drift.
         let sample_now = Instant::now();
         let sample_mono_ms = sample_now.as_millis();
 
-        if sample_mono_ms.saturating_sub(last_local_sample_ms) >= LOCAL_SAMPLE_INTERVAL_MS {
+        if sample_mono_ms >= next_local_sample_ms {
+            let scheduled_mono_ms = next_local_sample_ms;
             let link_up = last_valid_rx_time
                 .map(|last| sample_now.duration_since(last).as_secs() < LINK_LOSS_TIMEOUT_SECS)
                 .unwrap_or(false);
@@ -710,11 +720,44 @@ async fn main(spawner: Spawner) {
                 }
             }
 
-            last_local_sample_ms = sample_mono_ms;
+            let lateness_ms = sample_mono_ms.saturating_sub(scheduled_mono_ms);
+            if lateness_ms > LINK_WATCHDOG_INTERVAL_MS {
+                debug!(
+                    "LOCAL sample late: scheduled_ms={} actual_ms={} lateness_ms={}",
+                    scheduled_mono_ms, sample_mono_ms, lateness_ms
+                );
+            }
+
+            // Advance from the previous deadline. If some genuinely long
+            // operation caused us to miss one or more whole periods, skip those
+            // missed deadlines rather than emitting a burst of fake catch-up
+            // samples. The next real sample remains aligned to the original
+            // one-second cadence.
+            let after_sample_ms = Instant::now().as_millis();
+            loop {
+                next_local_sample_ms =
+                    next_local_sample_ms.saturating_add(LOCAL_SAMPLE_INTERVAL_MS);
+
+                if next_local_sample_ms > after_sample_ms {
+                    break;
+                }
+            }
         }
 
+        // Wake for whichever comes first: the normal 250 ms link-watchdog tick
+        // or the next LOCAL.LOG deadline. This keeps local sampling independent
+        // of the RX/watchdog cadence without introducing another task or moving
+        // storage ownership. Never cancel the SX1262 receive future here: we are
+        // timing out only the application RX channel, exactly as before.
+        let wait_now_ms = Instant::now().as_millis();
+        let until_local_sample_ms = next_local_sample_ms.saturating_sub(wait_now_ms);
+        let rx_wait_ms = core::cmp::min(
+            LINK_WATCHDOG_INTERVAL_MS,
+            until_local_sample_ms.max(1),
+        );
+
         let rx_result = with_timeout(
-            Duration::from_millis(LINK_WATCHDOG_INTERVAL_MS),
+            Duration::from_millis(rx_wait_ms),
             radio::RX_CHANNEL.receive(),
         )
         .await;
