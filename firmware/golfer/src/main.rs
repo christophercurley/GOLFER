@@ -14,6 +14,7 @@ mod audio;
 mod buttons;
 mod display;
 mod gps;
+mod packet;
 mod radio;
 mod spi0_bus;
 mod storage;
@@ -155,6 +156,24 @@ async fn main(spawner: Spawner) {
     let mut led = Output::new(p.PIN_25, Level::Low);
 
     info!("GOLFER firmware is online!");
+
+    // -------------------------------------------------------------------------
+    // Native GOLFER RF packet codec
+    //
+    // Commit A intentionally does NOT change live radio behavior. Run a small
+    // on-device golden-vector self-test so the 48-byte TelemetryV1 encoder,
+    // decoder, and application CRC32 are exercised on the RP2350 before we
+    // teach the legacy nRF beacon to transmit this format.
+    // -------------------------------------------------------------------------
+
+    if packet::golden_self_test() {
+        info!(
+            "Native TelemetryV1 codec self-test OK: {} bytes",
+            packet::TELEMETRY_V1_LEN
+        );
+    } else {
+        error!("Native TelemetryV1 codec self-test FAILED");
+    }
 
     // -------------------------------------------------------------------------
     // Shared SPI0 bus + immediate display initialization
