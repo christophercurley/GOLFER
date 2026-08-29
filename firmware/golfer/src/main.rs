@@ -483,9 +483,11 @@ async fn main(spawner: Spawner) {
     display.set_page(DisplayPage::General);
     info!("Boot initialization complete; entering general display");
 
-    // The SX1262 receive future now lives permanently inside its own task.
-    // The application only waits on RX_CHANNEL, which is safe to timeout.
-    spawner.spawn(radio::receive_task(radio).expect("failed to create radio receive task"));
+    // radio.rs is now the authoritative SX1262 owner. Its manager task uses
+    // cancellation-safe bounded RX windows so future TX/RX mode commands can be
+    // serialized without ever cancelling lora-phy IRQ processing mid-flow.
+    // The application still consumes the same RX_CHANNEL as before.
+    spawner.spawn(radio::task(radio).expect("failed to create radio manager task"));
 
     // -------------------------------------------------------------------------
     // Receiver state
@@ -764,7 +766,7 @@ async fn main(spawner: Spawner) {
 
         match rx_result {
             // -----------------------------------------------------------------
-            // Dedicated radio task delivered a packet.
+            // Authoritative radio-owner task delivered a packet.
             // -----------------------------------------------------------------
             Ok(packet) => {
                 let received_len = packet.len;
